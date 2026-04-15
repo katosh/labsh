@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-_lab_kernel.py — backend for `lab` subcommands that discover, attach to, and
+_labsh_kernel.py — backend for `labsh` subcommands that discover, attach to, and
 drive running Jupyter kernels without going through the REST API for code
 execution.
 
-This file is invoked by bin/lab. It is intentionally a single file with no
+This file is invoked by bin/labsh. It is intentionally a single file with no
 non-stdlib dependencies beyond psutil, jupyter_client, and nbformat — all of
-which are ensured in ./.venv by bin/lab before dispatching here.
+which are ensured in ./.venv by bin/labsh before dispatching here.
 
 Discovery strategy (borrowed from settylab/jupyter_kernel_inspector):
   * Kernels are scanned via psutil, matching cmdlines that contain
@@ -16,7 +16,7 @@ Discovery strategy (borrowed from settylab/jupyter_kernel_inspector):
   * Modern jupyter_server writes the absolute notebook path into the
     connection file as `jupyter_session`, so we get notebook<->kernel mapping
     for free.
-  * Running lab servers are discovered by walking the runtime dir's
+  * Running labsh servers are discovered by walking the runtime dir's
     jpserver-<pid>.json files and verifying the pid is alive.
 """
 
@@ -249,7 +249,7 @@ def server_for_path(servers: list[LabServer], path: Path) -> LabServer | None:
 
 
 class ContentsClient:
-    """Minimal client for a running lab server's /api/contents endpoint.
+    """Minimal client for a running labsh server's /api/contents endpoint.
 
     We use this for notebook reads/writes so the server broadcasts file-change
     events to any open frontend (avoiding the "file has been modified on
@@ -284,12 +284,12 @@ class ContentsClient:
                 raw = r.read()
         except urllib.error.HTTPError as e:
             raise RuntimeError(
-                f"lab: server {method} {rel_path} failed: "
+                f"labsh: server {method} {rel_path} failed: "
                 f"HTTP {e.code} {e.read().decode(errors='replace')}"
             ) from e
         except urllib.error.URLError as e:
             raise RuntimeError(
-                f"lab: cannot reach lab server at {self.server.url}: {e}"
+                f"labsh: cannot reach labsh server at {self.server.url}: {e}"
             ) from e
         return json.loads(raw) if raw else {}
 
@@ -297,7 +297,7 @@ class ContentsClient:
         doc = self._request("GET", rel_path)
         content = doc.get("content")
         if not isinstance(content, dict):
-            raise RuntimeError(f"lab: {rel_path}: not a notebook (type={doc.get('type')})")
+            raise RuntimeError(f"labsh: {rel_path}: not a notebook (type={doc.get('type')})")
         return content
 
     def put_notebook(self, rel_path: str, notebook: dict) -> dict:
@@ -314,7 +314,7 @@ def notebook_rel_path(nb_abs: Path, server: LabServer) -> str:
         return str(nb_abs.relative_to(root))
     except ValueError as e:
         raise RuntimeError(
-            f"lab: notebook {nb_abs} is not under lab server root {root}"
+            f"labsh: notebook {nb_abs} is not under labsh server root {root}"
         ) from e
 
 
@@ -413,8 +413,8 @@ def resolve_one(
         if not matches:
             _die(
                 f"{required_action}: no running kernel matches notebook "
-                f"'{notebook}'. `lab kernel ps` to list live kernels, or "
-                f"`lab notebook attach <path>` to spawn one."
+                f"'{notebook}'. `labsh kernel ps` to list live kernels, or "
+                f"`labsh notebook attach <path>` to spawn one."
             )
     elif kernel_sel is not None:
         matches = _match_kernel(kernels, kernel_sel)
@@ -425,8 +425,8 @@ def resolve_one(
             return kernels[0]
         if not kernels:
             _die(
-                f"{required_action}: no running kernels. Start lab "
-                f"(`lab` or `lab start`) and attach a notebook."
+                f"{required_action}: no running kernels. Start labsh "
+                f"(`labsh` or `labsh start`) and attach a notebook."
             )
         _die_with_candidates(
             f"{required_action}: multiple kernels running; pass -n NOTEBOOK or -k PID/ID",
@@ -471,7 +471,7 @@ def execute_in_kernel(
             kc.wait_for_ready(timeout=10)
         except RuntimeError as e:
             raise RuntimeError(
-                f"lab: kernel {kernel.short_id} is not responding: {e}"
+                f"labsh: kernel {kernel.short_id} is not responding: {e}"
             ) from e
 
         msg_id = kc.execute(code, store_history=False, allow_stdin=False)
@@ -611,7 +611,7 @@ def _print_table(rows: list[dict[str, str]], *, stream=sys.stdout) -> None:
 def _read_code(args: argparse.Namespace) -> str:
     if args.file:
         if args.code:
-            _die("lab: pass either CODE or -f FILE, not both")
+            _die("labsh: pass either CODE or -f FILE, not both")
         if args.file == "-":
             return sys.stdin.read()
         return Path(args.file).read_text()
@@ -619,7 +619,7 @@ def _read_code(args: argparse.Namespace) -> str:
         if len(args.code) == 1 and args.code[0] == "-":
             return sys.stdin.read()
         return "\n".join(args.code)
-    _die("lab: no code provided (pass CODE, -f FILE, or '-' for stdin)")
+    _die("labsh: no code provided (pass CODE, -f FILE, or '-' for stdin)")
 
 
 def _notebook_arg(args: argparse.Namespace) -> str | None:
@@ -638,7 +638,7 @@ def _kernel_arg(args: argparse.Namespace) -> str | None:
 def cmd_kernel_ps(args: argparse.Namespace) -> int:
     kernels = discover_kernels(current_user_only=not args.all_users)
     if not kernels:
-        eprint("lab: no running kernels")
+        eprint("labsh: no running kernels")
         return 0
     _print_table([k.as_row() for k in kernels])
     return 0
@@ -648,7 +648,7 @@ def cmd_kernel_find(args: argparse.Namespace) -> int:
     kernels = discover_kernels()
     matches = _match_notebook(kernels, args.query)
     if not matches:
-        eprint(f"lab: no running kernel matches '{args.query}'")
+        eprint(f"labsh: no running kernel matches '{args.query}'")
         return 1
     _print_table([k.as_row() for k in matches])
     return 0
@@ -775,7 +775,7 @@ def _resolve_notebook_path(arg: str | None) -> Path:
 
 
 def _load_notebook(nb_path: Path) -> tuple[dict, LabServer | None, str]:
-    """Load the notebook via a running lab server if possible, else from disk.
+    """Load the notebook via a running labsh server if possible, else from disk.
     Returns (notebook dict, server or None, path-key for saving)."""
     nb_path = nb_path.resolve()
     server = server_for_path(discover_servers(), nb_path)
@@ -825,7 +825,7 @@ def cmd_notebook_cells(args: argparse.Namespace) -> int:
         for i, cell in enumerate(cells)
     ]
     if not rows:
-        eprint(f"lab: {nb_path} has no cells")
+        eprint(f"labsh: {nb_path} has no cells")
         return 0
     _print_table(rows)
     return 0
@@ -901,7 +901,7 @@ def cmd_notebook_append(args: argparse.Namespace) -> int:
             _die("notebook append: --execute is not meaningful for markdown cells")
         cells.append(_make_md_cell(content))
         _save_notebook(nb, server, key, nb_path)
-        eprint(f"lab: appended markdown cell at index {len(cells) - 1}")
+        eprint(f"labsh: appended markdown cell at index {len(cells) - 1}")
         return 0
 
     exit_code = 0
@@ -922,7 +922,7 @@ def cmd_notebook_append(args: argparse.Namespace) -> int:
         _make_code_cell(content, outputs=outputs, execution_count=execution_count)
     )
     _save_notebook(nb, server, key, nb_path)
-    msg = f"lab: appended code cell at index {len(cells) - 1}"
+    msg = f"labsh: appended code cell at index {len(cells) - 1}"
     if args.execute:
         msg += f" (executed, exit={exit_code})"
     eprint(msg)
@@ -972,14 +972,14 @@ def cmd_notebook_replace(args: argparse.Namespace) -> int:
 
 def cmd_notebook_attach(args: argparse.Namespace) -> int:
     """Ensure a kernel exists for the given notebook path by asking a running
-    lab server to create a Session for it. Prints the resulting kernel row."""
+    labsh server to create a Session for it. Prints the resulting kernel row."""
     nb_path = _resolve_notebook_path(args.notebook)
     servers = discover_servers()
     server = server_for_path(servers, nb_path)
     if server is None:
         _die(
-            "notebook attach: no running lab server owns this notebook. "
-            "Start one with `lab` (foreground) or `lab start` (background)."
+            "notebook attach: no running labsh server owns this notebook. "
+            "Start one with `labsh` (foreground) or `labsh start` (background)."
         )
     rel = notebook_rel_path(nb_path, server)
     # Check if a live kernel already exists.
@@ -1012,10 +1012,10 @@ def cmd_notebook_attach(args: argparse.Namespace) -> int:
             f"HTTP {e.code} {e.read().decode(errors='replace')}"
         )
     except urllib.error.URLError as e:
-        _die(f"notebook attach: cannot reach lab server: {e}")
+        _die(f"notebook attach: cannot reach labsh server: {e}")
     # Give the kernel a moment to start before scanning again.
     kernel_id = (data.get("kernel") or {}).get("id", "?")
-    eprint(f"lab: created session for {rel} (kernel id {kernel_id})")
+    eprint(f"labsh: created session for {rel} (kernel id {kernel_id})")
     for _ in range(20):
         time.sleep(0.25)
         new_kernels = discover_kernels()
@@ -1023,7 +1023,7 @@ def cmd_notebook_attach(args: argparse.Namespace) -> int:
         if hits:
             _print_table([k.as_row() for k in hits])
             return 0
-    eprint("lab: session created but kernel did not appear in process scan yet")
+    eprint("labsh: session created but kernel did not appear in process scan yet")
     return 0
 
 
@@ -1057,15 +1057,15 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_stop(args: argparse.Namespace) -> int:
     servers = discover_servers()
     if not servers:
-        eprint("lab: no running lab server to stop")
+        eprint("labsh: no running labsh server to stop")
         return 1
     for s in servers:
         if args.all or s.root_dir.resolve() == PROJECT_DIR.resolve():
             try:
                 os.kill(s.pid, signal.SIGTERM)
-                eprint(f"lab: sent SIGTERM to lab server pid {s.pid}")
+                eprint(f"labsh: sent SIGTERM to labsh server pid {s.pid}")
             except ProcessLookupError:
-                eprint(f"lab: pid {s.pid} already gone")
+                eprint(f"labsh: pid {s.pid} already gone")
     return 0
 
 
@@ -1100,7 +1100,7 @@ def _add_code_inputs(p: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="lab", add_help=True)
+    parser = argparse.ArgumentParser(prog="labsh", add_help=True)
     sub = parser.add_subparsers(dest="group", required=True)
 
     # --- kernel ----------------------------------------------------------------
@@ -1127,7 +1127,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_kernel_inspect)
 
     # --- notebook --------------------------------------------------------------
-    p_n = sub.add_parser("notebook", help="Read and edit notebook files via the running lab server")
+    p_n = sub.add_parser("notebook", help="Read and edit notebook files via the running labsh server")
     sn = p_n.add_subparsers(dest="cmd", required=True)
 
     p = sn.add_parser("cells", help="List cells (idx, type, snippet)")
@@ -1153,17 +1153,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_code_inputs(p)
     p.set_defaults(func=cmd_notebook_replace)
 
-    p = sn.add_parser("attach", help="Ensure a kernel is running for the given notebook (via lab server)")
+    p = sn.add_parser("attach", help="Ensure a kernel is running for the given notebook (via labsh server)")
     p.add_argument("notebook", nargs="?")
     p.add_argument("--kernel-name", default=None, help="kernelspec name (default: python3)")
     p.set_defaults(func=cmd_notebook_attach)
 
     # --- status / stop ---------------------------------------------------------
-    p = sub.add_parser("status", help="Show running lab servers and kernels")
+    p = sub.add_parser("status", help="Show running labsh servers and kernels")
     p.set_defaults(func=cmd_status, group="status", cmd="status")
 
-    p = sub.add_parser("stop", help="Stop background lab server(s) owning this project")
-    p.add_argument("--all", action="store_true", help="Stop every discoverable lab server, not just this project's")
+    p = sub.add_parser("stop", help="Stop background labshsh server(s) owning this project")
+    p.add_argument("--all", action="store_true", help="Stop every discoverable labshsh server, not just this project's")
     p.set_defaults(func=cmd_stop, group="stop", cmd="stop")
 
     return parser

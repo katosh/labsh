@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# test-lab.sh — end-to-end tests for the `lab` CLI's kernel discovery,
+# test-labsh.sh — end-to-end tests for the `labsh` CLI's kernel discovery,
 # execution, and notebook-editing capabilities.
 #
 # Spins up a real JupyterLab instance, spawns a kernel via the Sessions
-# API, and exercises the full lab CLI surface.
+# API, and exercises the full labsh CLI surface.
 #
 # Requirements: uv on PATH.  Run from the repo root:
-#     ./test-lab.sh
+#     ./test-labsh.sh
 # Or with verbose output:
-#     VERBOSE=1 ./test-lab.sh
+#     VERBOSE=1 ./test-labsh.sh
 
 set -euo pipefail
 
@@ -17,10 +17,10 @@ set -euo pipefail
 # ── Paths ──────────────────────────────────────────────────────────────────
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LAB="$REPO_DIR/bin/lab"
-HELPER="$REPO_DIR/bin/_lab_kernel.py"
+LAB="$REPO_DIR/bin/labsh"
+HELPER="$REPO_DIR/bin/_labsh_kernel.py"
 
-WORK_DIR="$(mktemp -d -t lab-test-XXXXXX)"
+WORK_DIR="$(mktemp -d -t labsh-test-XXXXXX)"
 VENV_DIR="$WORK_DIR/.venv"
 JUPYTER_CONFIG_DIR="$WORK_DIR/.jupyter"
 JUPYTER_DATA_DIR="$WORK_DIR/.jupyter/share/jupyter"
@@ -68,7 +68,7 @@ run_test() {
 }
 
 lab_py() {
-    # Run the Python helper directly (faster than going through bin/lab's
+    # Run the Python helper directly (faster than going through bin/labsh's
     # dependency-ensure path which was already run during setup).
     cd "$WORK_DIR" && "$VENV_DIR/bin/python" "$HELPER" "$@"
 }
@@ -101,7 +101,7 @@ wait_for_kernel() {
 
 # ── Setup ──────────────────────────────────────────────────────────────────
 
-echo "test-lab: setting up in $WORK_DIR (port $PORT)"
+echo "test-labsh: setting up in $WORK_DIR (port $PORT)"
 
 command -v uv >/dev/null 2>&1 || { echo "SKIP: uv not found"; exit 0; }
 
@@ -135,7 +135,7 @@ cd "$WORK_DIR"
 SERVER_PID=$!
 vlog "server pid $SERVER_PID"
 
-echo "test-lab: waiting for server..."
+echo "test-labsh: waiting for server..."
 if ! wait_for_server 15; then
     echo "FAIL: jupyter-lab did not start within 15 s"
     cat "$WORK_DIR/jupyter.log"
@@ -150,7 +150,7 @@ curl -sf "http://127.0.0.1:$PORT/api/sessions" \
     -d '{"kernel":{"name":"python3"},"name":"hello.ipynb","path":"hello.ipynb","type":"notebook"}' \
     > /dev/null
 
-echo "test-lab: waiting for kernel..."
+echo "test-labsh: waiting for kernel..."
 if ! wait_for_kernel 15; then
     echo "FAIL: kernel did not appear within 15 s"
     exit 1
@@ -160,7 +160,7 @@ vlog "kernel ready"
 # ── Tests ──────────────────────────────────────────────────────────────────
 
 echo
-echo "test-lab: running tests"
+echo "test-labsh: running tests"
 
 # --- kernel ps ---
 
@@ -324,7 +324,7 @@ run_test "notebook replace rewrites cell" test_nb_replace
 # ── Summary ────────────────────────────────────────────────────────────────
 
 echo
-echo "test-lab: $pass/$total passed, $fail failed"
+echo "test-labsh: $pass/$total passed, $fail failed"
 if [ "$fail" -gt 0 ]; then
     exit 1
 fi
