@@ -78,7 +78,10 @@ labsh kernel exec -n analysis.ipynb "df.describe()"
 
 | Command | Description |
 |---------|-------------|
-| `labsh kernel add [NAME]` | Create `.venv` and register kernel |
+| `labsh kernel add [NAME] [PKGS...]` | Create `.venv`, register kernel, install packages |
+| `labsh kernel install PKGS...` | Install packages into the kernel `.venv` |
+| `labsh kernel shell` | Enter a subshell with `.venv` activated |
+| `labsh kernel run [--] CMD...` | Run a command inside the `.venv` |
 | `labsh kernel list` | List registered kernels |
 | `labsh kernel remove NAME` | Unregister a kernel |
 

@@ -93,7 +93,10 @@ ssh -L 8888:localhost:8888 user@host
 
 | Command                 | What it does |
 |-------------------------|-------------|
-| `labsh kernel add [NAME]` | Create `.venv`, install ipykernel, register kernelspec |
+| `labsh kernel add [NAME] [PKGS...]` | Create `.venv`, register kernelspec, install packages |
+| `labsh kernel install PKGS...` | Install packages into the kernel `.venv` |
+| `labsh kernel shell`    | Enter a subshell with `.venv` activated |
+| `labsh kernel run [--] CMD...` | Run a command inside the `.venv` |
 | `labsh kernel list`       | List registered kernelspecs |
 | `labsh kernel remove N`   | Unregister a kernelspec |
 

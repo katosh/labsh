@@ -11,8 +11,9 @@ for the next — no need to reload expensive state each turn.
 ## Startup
 
 ```bash
-labsh kernel add            # one-time: create .venv, register kernel
-labsh start                 # daemonize JupyterLab (log: .jupyter/labsh.bg.log)
+labsh kernel add                      # create .venv, register kernel
+labsh kernel add mykernel pandas numpy  # with packages
+labsh start                           # daemonize JupyterLab
 ```
 
 ## Core workflow
@@ -52,7 +53,10 @@ With neither flag and exactly one running kernel, it auto-selects.
 ### Kernels
 | Command | What it does |
 |---------|-------------|
-| `labsh kernel add [NAME]` | Create `.venv`, register kernel |
+| `labsh kernel add [NAME] [PKGS...]` | Create `.venv`, register kernel, install packages |
+| `labsh kernel install PKGS...` | Install packages into kernel `.venv` |
+| `labsh kernel shell` | Enter subshell with `.venv` activated |
+| `labsh kernel run [--] CMD...` | Run a command inside `.venv` |
 | `labsh kernel list` | List registered kernels |
 | `labsh kernel remove NAME` | Unregister |
 | `labsh kernel ps` | List running kernels |
@@ -69,6 +73,15 @@ With neither flag and exactly one running kernel, it auto-selects.
 | `labsh notebook show [-n PATH] IDX` | Print cell source + outputs |
 | `labsh notebook append [-n PATH] [--execute] CODE` | Append cell |
 | `labsh notebook replace [-n PATH] IDX [--execute] CODE` | Replace cell |
+
+## Venv management
+
+```bash
+labsh kernel install pandas scikit-learn  # add packages to .venv
+labsh kernel shell                        # interactive subshell with .venv
+labsh kernel run -- python script.py      # run a command inside .venv
+labsh kernel run -- uv pip list           # inspect installed packages
+```
 
 ## Tips
 

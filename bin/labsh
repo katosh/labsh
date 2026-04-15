@@ -93,7 +93,12 @@ USAGE
   labsh password                 Set a persistent password (stored in ./.jupyter)
   labsh help                     Show this help
 
-  labsh kernel add [NAME]        Create ./.venv and register it as a kernelspec
+  labsh kernel add [NAME] [PKGS...]
+                               Create ./.venv, register it as a kernelspec,
+                               and install PKGS (e.g. pandas numpy)
+  labsh kernel install PKGS...   Install packages into the kernel .venv
+  labsh kernel shell             Enter a subshell with .venv activated
+  labsh kernel run [--] CMD...   Run a command inside the .venv
   labsh kernel list              List registered kernelspecs in this project
   labsh kernel remove NAME       Unregister a kernelspec
 
@@ -197,6 +202,8 @@ sanitize_kernel_name() {
 }
 
 ensure_venv_with_ipykernel() {
+    # Create .venv if needed, ensure ipykernel+ipywidgets, install extra
+    # packages passed as arguments.
     require_uv
     if [ ! -x "$VENV_DIR/bin/python" ]; then
         echo "$PROG: creating venv at $VENV_DIR" >&2
@@ -205,6 +212,10 @@ ensure_venv_with_ipykernel() {
     local missing=()
     "$VENV_DIR/bin/python" -c "import ipykernel_launcher" 2>/dev/null || missing+=(ipykernel)
     "$VENV_DIR/bin/python" -c "import ipywidgets"        2>/dev/null || missing+=(ipywidgets)
+    # Append any extra packages requested by the caller
+    if [ $# -gt 0 ]; then
+        missing+=("$@")
+    fi
     if [ ${#missing[@]} -gt 0 ]; then
         echo "$PROG: installing ${missing[*]} into $VENV_DIR" >&2
         uv pip install --python "$VENV_DIR/bin/python" "${missing[@]}"
@@ -322,11 +333,15 @@ check_existing_server() {
 }
 
 cmd_kernel_add() {
+    # Usage: labsh kernel add [NAME] [PACKAGES...]
+    # NAME defaults to basename of $PWD.  Any remaining args are extra
+    # packages to install alongside ipykernel (e.g. pandas numpy).
     local raw_name="${1:-$(basename "$DIR")}"
+    shift 2>/dev/null || true
     local name; name="$(sanitize_kernel_name "$raw_name")"
     [ -n "$name" ] || die "kernel add: empty name after sanitization"
-    ensure_venv_with_ipykernel    # only place that touches project .venv
-    ensure_lab_venv               # ensure labsh helper venv exists too
+    ensure_venv_with_ipykernel "$@"  # pass extra packages through
+    ensure_lab_venv                  # ensure labsh helper venv exists too
     mkdir -p "$JUPYTER_CONFIG_DIR"
     "$VENV_DIR/bin/python" -m ipykernel install \
         --prefix "$JUPYTER_CONFIG_DIR" \
@@ -360,11 +375,57 @@ cmd_kernel_remove() {
     echo "$PROG: removed kernel '$name'" >&2
 }
 
+cmd_kernel_install() {
+    # Usage: labsh kernel install PACKAGES...
+    # Install packages into the project .venv.  The venv must already exist
+    # (run `labsh kernel add` first).
+    [ $# -gt 0 ] || die "kernel install: no packages specified
+Usage: labsh kernel install PACKAGES..."
+    require_uv
+    [ -x "$VENV_DIR/bin/python" ] || die "kernel install: no .venv found. Run '$PROG kernel add' first."
+    echo "$PROG: installing $* into $VENV_DIR" >&2
+    uv pip install --python "$VENV_DIR/bin/python" "$@"
+    # Pre-compile and update lockfile
+    "$VENV_DIR/bin/python" -m compileall -q "$VENV_DIR/lib" 2>/dev/null || true
+    local kernel_lock="$JUPYTER_CONFIG_DIR/.kernel-deps.lock"
+    mkdir -p "$JUPYTER_CONFIG_DIR"
+    uv pip freeze --python "$VENV_DIR/bin/python" > "$kernel_lock" 2>/dev/null || true
+    echo "$PROG: updated $kernel_lock" >&2
+}
+
+cmd_kernel_shell() {
+    # Usage: labsh kernel shell
+    # Drop into a subshell with the project .venv activated.
+    [ -x "$VENV_DIR/bin/python" ] || die "kernel shell: no .venv found. Run '$PROG kernel add' first."
+    echo "$PROG: entering .venv shell (exit to return)" >&2
+    # Use VIRTUAL_ENV + prepend to PATH so the shell behaves like
+    # `source .venv/bin/activate` without modifying the user's rc files.
+    VIRTUAL_ENV="$VENV_DIR" \
+    PATH="$VENV_DIR/bin:$PATH" \
+        exec "${SHELL:-/bin/bash}"
+}
+
+cmd_kernel_run() {
+    # Usage: labsh kernel run [--] CMD [ARGS...]
+    # Run a command with the project .venv's python on PATH.
+    [ -x "$VENV_DIR/bin/python" ] || die "kernel run: no .venv found. Run '$PROG kernel add' first."
+    # Skip optional -- separator
+    [ "${1:-}" = "--" ] && shift
+    [ $# -gt 0 ] || die "kernel run: no command specified
+Usage: labsh kernel run [--] CMD [ARGS...]"
+    VIRTUAL_ENV="$VENV_DIR" \
+    PATH="$VENV_DIR/bin:$PATH" \
+        exec "$@"
+}
+
 cmd_kernel() {
     local sub="${1:-}"
     [ $# -gt 0 ] && shift
     case "$sub" in
         add)         cmd_kernel_add        "$@" ;;
+        install|pip) cmd_kernel_install    "$@" ;;
+        shell|sh)    cmd_kernel_shell      "$@" ;;
+        run)         cmd_kernel_run        "$@" ;;
         list|ls)     cmd_kernel_list       "$@" ;;
         remove|rm)   cmd_kernel_remove     "$@" ;;
         ps|find|exec|inspect)
@@ -372,11 +433,14 @@ cmd_kernel() {
         ""|help|-h|--help)
             cat >&2 <<'KHELP'
 Usage:
-  labsh kernel add [NAME]        Create ./.venv and register it as a kernelspec
-  labsh kernel list              List registered kernelspecs
-  labsh kernel remove NAME       Unregister a kernelspec
-  labsh kernel ps                List RUNNING kernels (PID, id, notebook)
-  labsh kernel find QUERY        Resolve a notebook path to its running kernel(s)
+  labsh kernel add [NAME] [PKGS...]  Create ./.venv, register kernelspec, install packages
+  labsh kernel install PKGS...       Install packages into the kernel .venv
+  labsh kernel shell                 Enter a subshell with .venv activated
+  labsh kernel run [--] CMD...       Run a command inside the .venv
+  labsh kernel list                  List registered kernelspecs
+  labsh kernel remove NAME           Unregister a kernelspec
+  labsh kernel ps                    List RUNNING kernels (PID, id, notebook)
+  labsh kernel find QUERY            Resolve a notebook path to its running kernel(s)
   labsh kernel exec [-n NB|-k K] CODE   Execute code in a running kernel
   labsh kernel inspect [-n NB|-k K]     Print live variables (%whos)
 KHELP
