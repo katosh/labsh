@@ -34,8 +34,12 @@ cleanup() {
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
     fi
-    [ -n "${PORT:-}" ] && pkill -f "jupyter-lab.*--port $PORT" 2>/dev/null || true
-    [ -n "${INTEG_RUNTIME_DIR:-}" ] && pkill -f "ipykernel_launcher.*$INTEG_RUNTIME_DIR" 2>/dev/null || true
+    if [ -n "${PORT:-}" ]; then
+        pkill -f "jupyter-lab.*--port $PORT" 2>/dev/null || true
+    fi
+    if [ -n "${INTEG_RUNTIME_DIR:-}" ]; then
+        pkill -f "ipykernel_launcher.*$INTEG_RUNTIME_DIR" 2>/dev/null || true
+    fi
     rm -rf "$UNIT_WORK_DIR" "$INTEG_WORK_DIR"
 }
 trap cleanup EXIT
@@ -208,6 +212,7 @@ run_test "kernel run fails with no command" test_kernel_run_no_command
 test_kernel_shell_env() {
     local out
     # Run /bin/sh as SHELL, feed it a command via stdin, verify env
+    # shellcheck disable=SC2016  # inner shell expands $VIRTUAL_ENV
     out="$(echo 'echo "VENV=$VIRTUAL_ENV"; exit' | \
         timeout 5 env SHELL=/bin/sh \
         sh -c "cd '$UNIT_WORK_DIR' && '$LAB' kernel shell" 2>/dev/null)"
@@ -217,6 +222,7 @@ run_test "kernel shell sets VIRTUAL_ENV" test_kernel_shell_env
 
 test_kernel_shell_path() {
     local out
+    # shellcheck disable=SC2016  # inner shell expands $PATH
     out="$(echo 'echo "$PATH"; exit' | \
         timeout 5 env SHELL=/bin/sh \
         sh -c "cd '$UNIT_WORK_DIR' && '$LAB' kernel shell" 2>/dev/null)"
@@ -279,8 +285,9 @@ lab_py() {
 }
 
 wait_for_server() {
-    local max_wait="${1:-15}" i
-    for i in $(seq 1 "$max_wait"); do
+    local max_wait="${1:-15}"
+    local _i
+    for _i in $(seq 1 "$max_wait"); do
         compgen -G "$INTEG_RUNTIME_DIR/jpserver-*.json" >/dev/null 2>&1 && return 0
         sleep 1
     done
@@ -288,8 +295,9 @@ wait_for_server() {
 }
 
 wait_for_kernel() {
-    local max_wait="${1:-15}" i
-    for i in $(seq 1 "$max_wait"); do
+    local max_wait="${1:-15}"
+    local _i
+    for _i in $(seq 1 "$max_wait"); do
         lab_py kernel ps 2>/dev/null | grep -q 'hello.ipynb' && return 0
         sleep 1
     done
@@ -419,8 +427,8 @@ test_exec_auto_select() {
         echo "  [skip] $kcount kernels running (need exactly 1)" >&2
         return 0  # pass-through: can't test auto-select on multi-kernel systems
     fi
-    local out attempt
-    for attempt in 1 2 3; do
+    local out _attempt
+    for _attempt in 1 2 3; do
         out="$(lab_py kernel exec "print('auto')" 2>&1 || true)"
         if echo "$out" | grep -q "auto"; then
             return 0

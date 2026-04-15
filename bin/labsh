@@ -31,7 +31,7 @@ LAB_VENV_LINK="$JUPYTER_CONFIG_DIR/.labshvenv"
 
 # Resolve the actual labsh venv path: follow symlink if it exists and target
 # is alive; otherwise we'll create a new one in ensure_lab_venv.
-if [ -L "$LAB_VENV_LINK" ] && [ -x "$(readlink -f "$LAB_VENV_LINK" 2>/dev/null)/bin/python" 2>/dev/null ]; then
+if [ -L "$LAB_VENV_LINK" ] && [ -x "$(readlink -f "$LAB_VENV_LINK" 2>/dev/null)/bin/python" ]; then
     LAB_VENV_DIR="$(readlink -f "$LAB_VENV_LINK")"
 else
     LAB_VENV_DIR="$_LAB_VENV_TMP"
