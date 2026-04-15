@@ -11,12 +11,14 @@ PREFIX   ?= $(HOME)/.local
 LIBDIR   := $(PREFIX)/lib/labsh
 BINDIR   := $(PREFIX)/bin
 DOCDIR   := $(PREFIX)/share/doc/labsh
+CMDDIR   := $(PREFIX)/lib/labsh/commands
+CLAUDE_COMMANDS := $(HOME)/.claude/commands
 
 INSTALL  := install
 SRC_DIR  := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 VERSION  := $(shell cat $(SRC_DIR)/VERSION 2>/dev/null || echo 0.0.0)
 
-.PHONY: all install install-lib install-bin install-docs uninstall check version
+.PHONY: all install install-lib install-bin install-docs install-skill uninstall check version
 
 all:
 	@echo "labsh $(VERSION) — project-local JupyterLab management CLI"
@@ -32,12 +34,13 @@ version:
 
 # ── install ─────────────────────────────────────────────────────
 
-install: install-lib install-bin install-docs
+install: install-lib install-bin install-docs install-skill
 	@echo ""
 	@echo "Installed labsh $(VERSION) to $(DESTDIR)$(PREFIX)"
 	@echo "  Binary:  $(DESTDIR)$(BINDIR)/labsh"
 	@echo "  Library: $(DESTDIR)$(LIBDIR)/"
 	@echo "  Docs:    $(DESTDIR)$(DOCDIR)/"
+	@echo "  Skill:   $(CLAUDE_COMMANDS)/labsh.md"
 	@echo ""
 	@echo "Quick start:"
 	@echo "  cd /path/to/project"
@@ -64,12 +67,21 @@ install-docs:
 	$(INSTALL) -m 644 $(SRC_DIR)/doc/labsh.md $(DESTDIR)$(DOCDIR)/
 	$(INSTALL) -m 644 $(SRC_DIR)/LICENSE $(DESTDIR)$(DOCDIR)/
 
+install-skill:
+	$(INSTALL) -d $(DESTDIR)$(CMDDIR)
+	$(INSTALL) -m 644 $(SRC_DIR)/commands/labsh.md $(DESTDIR)$(CMDDIR)/labsh.md
+	@# Symlink into Claude Code user commands (creates dir if needed)
+	@mkdir -p $(CLAUDE_COMMANDS)
+	@ln -sfn $(DESTDIR)$(CMDDIR)/labsh.md $(CLAUDE_COMMANDS)/labsh.md
+	@echo "  Skill:   $(CLAUDE_COMMANDS)/labsh.md → $(DESTDIR)$(CMDDIR)/labsh.md"
+
 # ── uninstall ───────────────────────────────────────────────────
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/labsh
 	rm -rf $(DESTDIR)$(LIBDIR)
 	rm -rf $(DESTDIR)$(DOCDIR)
+	rm -f $(CLAUDE_COMMANDS)/labsh.md
 	@echo "Removed labsh from $(DESTDIR)$(PREFIX)"
 
 # ── check ───────────────────────────────────────────────────────
