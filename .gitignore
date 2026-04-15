@@ -1,0 +1,4 @@
+.jupyter/
+.venv/
+__pycache__/
+*.pyc
