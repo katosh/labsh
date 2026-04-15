@@ -45,7 +45,7 @@ cleanup() {
 trap cleanup EXIT
 
 log() { echo "  $*"; }
-vlog() { [ "$VERBOSE" = "1" ] && echo "  [v] $*" || true; }
+vlog() { if [ "$VERBOSE" = "1" ]; then echo "  [v] $*"; fi; }
 
 run_test() {
     local name="$1"; shift

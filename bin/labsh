@@ -615,8 +615,9 @@ cmd_start() {
     echo "$bg_pid" > "$BG_PID_FILE"
 
     # Wait for the server URL to appear in the log, then print it cleanly.
-    local attempt url_line scheme auth_info
-    for attempt in $(seq 1 30); do
+    local url_line auth_info
+    local _attempt
+    for _attempt in $(seq 1 30); do
         if grep -qE 'https?://' "$BG_LOG_FILE" 2>/dev/null; then
             url_line="$(grep -oE 'https?://[^ ]+' "$BG_LOG_FILE" | tail -1)" || true
             if [ -n "$url_line" ]; then
@@ -674,7 +675,7 @@ cmd_url() {
     # Print the access URL of the running labsh server.
     local runtime_dir="$JUPYTER_DATA_DIR/runtime"
     [ -d "$runtime_dir" ] || die "no labsh server running (no runtime dir)"
-    local jf pid url token scheme
+    local jf pid url token
     for jf in "$runtime_dir"/jpserver-*.json; do
         [ -e "$jf" ] || continue
         pid="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('pid',''))" "$jf" 2>/dev/null)" || continue
