@@ -19,6 +19,9 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB="$REPO_DIR/bin/labsh"
 HELPER="$REPO_DIR/bin/_labsh_kernel.py"
+# Extract LAB_PYTHON from bin/labsh so the test uses the same Python version
+LAB_PYTHON="$(grep -m1 '^LAB_PYTHON=' "$LAB" | cut -d'"' -f2)"
+: "${LAB_PYTHON:=3.12}"
 
 UNIT_WORK_DIR="$(mktemp -d -t labsh-unit-XXXXXX)"
 INTEG_WORK_DIR="$(mktemp -d -t labsh-integ-XXXXXX)"
@@ -308,7 +311,7 @@ echo "test-labsh: integration tests in $INTEG_WORK_DIR (port $PORT)"
 
 mkdir -p "$INTEG_JUPYTER_CONFIG_DIR" "$INTEG_JUPYTER_DATA_DIR" "$INTEG_RUNTIME_DIR"
 
-uv venv "$INTEG_VENV_DIR" >/dev/null 2>&1
+uv venv --python "$LAB_PYTHON" "$INTEG_VENV_DIR" >/dev/null 2>&1
 uv pip install --python "$INTEG_VENV_DIR/bin/python" \
     jupyterlab ipykernel psutil nbformat 2>&1 | tail -1
 

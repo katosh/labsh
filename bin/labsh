@@ -5,6 +5,7 @@
 set -eo pipefail
 
 PROG="labsh"
+LAB_PYTHON="3.12"                         # Python used by uvx for JupyterLab
 DIR="$PWD"
 : "${JUPYTER_CONFIG_DIR:=$DIR/.jupyter}"
 : "${JUPYTER_DATA_DIR:=$DIR/.jupyter/share/jupyter}"
@@ -42,6 +43,13 @@ fi
 # symlink or from $PATH.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPER_PY="$SCRIPT_DIR/_labsh_kernel.py"
+# VERSION lives alongside the script in installed layout (lib/labsh/bin/),
+# or one directory up in the source tree.
+if [ -f "$SCRIPT_DIR/../VERSION" ]; then
+    VERSION_FILE="$SCRIPT_DIR/../VERSION"
+else
+    VERSION_FILE="$SCRIPT_DIR/VERSION"
+fi
 
 export JUPYTER_CONFIG_DIR JUPYTER_DATA_DIR
 
@@ -92,6 +100,7 @@ USAGE
   labsh url                      Print the access URL of the running server
   labsh password                 Set a persistent password (stored in ./.jupyter)
   labsh help                     Show this help
+  labsh version                  Print version and exit
 
   labsh kernel add [NAME] [PKGS...]
                                Create ./.venv, register it as a kernelspec,
@@ -597,7 +606,7 @@ cmd_start() {
     ensure_lab_venv
     ensure_jupyter_config
 
-    uvx --python 3.12 --from jupyterlab \
+    uvx --python "$LAB_PYTHON" --from jupyterlab \
         --with jupyterlmod \
         --with jupyterlab_notify \
         --with jupyterlab_execute_time \
@@ -668,7 +677,7 @@ cmd_status() {
 cmd_password() {
     require_uv
     mkdir -p "$JUPYTER_CONFIG_DIR"
-    exec uvx --python 3.12 --from jupyterlab jupyter-lab password "$@"
+    exec uvx --python "$LAB_PYTHON" --from jupyterlab jupyter-lab password "$@"
 }
 
 cmd_url() {
@@ -709,7 +718,7 @@ cmd_serve() {
     ensure_lab_venv
     ensure_jupyter_config
 
-    exec uvx --python 3.12 --from jupyterlab \
+    exec uvx --python "$LAB_PYTHON" --from jupyterlab \
         --with jupyterlmod \
         --with jupyterlab_notify \
         --with jupyterlab_execute_time \
@@ -725,6 +734,8 @@ cmd_serve() {
 
 main() {
     case "${1:-}" in
+        version|--version|-V)
+            cat "$VERSION_FILE" 2>/dev/null || echo "unknown" ;;
         help|-h|--help)  usage ;;
         kernel)          shift; cmd_kernel   "$@" ;;
         notebook)        shift; cmd_notebook "$@" ;;

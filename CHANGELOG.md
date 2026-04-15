@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.1] - 2026-04-15
+
+### Added
+
+- **`labsh version`:** New command (also `--version`, `-V`) prints the installed version.
+- **`notebook append` auto-creates notebooks:** Appending to a non-existent notebook
+  now creates it automatically instead of crashing with HTTP 404.
+
+### Fixed
+
+- **`labshsh` typo** in `_labsh_kernel.py` stop subparser help text.
+- **Integration tests on Python 3.13:** Test suite now uses the same Python version
+  as the labsh runtime (`LAB_PYTHON` variable) instead of the system default,
+  fixing failures on systems where Python 3.13 lacks sqlite3.
+- **`LAB_PYTHON` variable:** Extracted hard-coded Python version into a single
+  variable in `bin/labsh`, referenced by both the script and the test suite.
+
 ## [0.2.0] - 2026-04-15
 
 ### Added

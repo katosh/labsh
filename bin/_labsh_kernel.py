@@ -774,16 +774,47 @@ def _resolve_notebook_path(arg: str | None) -> Path:
     )
 
 
-def _load_notebook(nb_path: Path) -> tuple[dict, LabServer | None, str]:
+def _new_notebook() -> dict:
+    """Return a minimal empty notebook (nbformat v4)."""
+    return {
+        "nbformat": 4,
+        "nbformat_minor": 5,
+        "metadata": {
+            "kernelspec": {
+                "display_name": "Python 3",
+                "language": "python",
+                "name": "python3",
+            },
+            "language_info": {"name": "python", "version": "3"},
+        },
+        "cells": [],
+    }
+
+
+def _load_notebook(
+    nb_path: Path, *, allow_create: bool = False
+) -> tuple[dict, LabServer | None, str]:
     """Load the notebook via a running labsh server if possible, else from disk.
-    Returns (notebook dict, server or None, path-key for saving)."""
+    Returns (notebook dict, server or None, path-key for saving).
+
+    If allow_create is True and the notebook doesn't exist, returns a fresh
+    empty notebook instead of raising an error."""
     nb_path = nb_path.resolve()
     server = server_for_path(discover_servers(), nb_path)
     if server is not None:
         rel = notebook_rel_path(nb_path, server)
         client = ContentsClient(server)
-        return client.get_notebook(rel), server, rel
+        try:
+            return client.get_notebook(rel), server, rel
+        except RuntimeError:
+            if allow_create:
+                eprint(f"labsh: creating new notebook {nb_path.name}")
+                return _new_notebook(), server, rel
+            raise
     # Fallback: read directly.
+    if allow_create and not nb_path.exists():
+        eprint(f"labsh: creating new notebook {nb_path.name}")
+        return _new_notebook(), None, str(nb_path)
     import nbformat  # type: ignore
 
     nb = nbformat.read(str(nb_path), as_version=4)
@@ -892,7 +923,7 @@ def _make_md_cell(source: str) -> dict:
 
 def cmd_notebook_append(args: argparse.Namespace) -> int:
     nb_path = _resolve_notebook_path(args.notebook)
-    nb, server, key = _load_notebook(nb_path)
+    nb, server, key = _load_notebook(nb_path, allow_create=True)
     cells = nb.setdefault("cells", [])
     content = _read_code(args)
 
@@ -1162,8 +1193,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", help="Show running labsh servers and kernels")
     p.set_defaults(func=cmd_status, group="status", cmd="status")
 
-    p = sub.add_parser("stop", help="Stop background labshsh server(s) owning this project")
-    p.add_argument("--all", action="store_true", help="Stop every discoverable labshsh server, not just this project's")
+    p = sub.add_parser("stop", help="Stop background labsh server(s) owning this project")
+    p.add_argument("--all", action="store_true", help="Stop every discoverable labsh server, not just this project's")
     p.set_defaults(func=cmd_stop, group="stop", cmd="stop")
 
     return parser
