@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.2] - 2026-04-17
+
+### Fixed
+
+- **False "binding to 0.0.0.0 without a password" warning:** The password
+  check was only looking at `ServerApp.password` / `NotebookApp.password`,
+  missing the `IdentityProvider.hashed_password` key written by
+  `jupyter server password` under Jupyter Server 2.x (what `labsh password`
+  invokes). It now also recognises `PasswordIdentityProvider.hashed_password`
+  and passwords set via `jupyter_server_config.py`.
+
 ## [0.2.1] - 2026-04-15
 
 ### Added

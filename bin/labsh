@@ -523,13 +523,31 @@ except OSError:
 
 check_password_set() {
     # Check if a Jupyter password is configured. Returns 0 if set.
-    local pw_file="$JUPYTER_CONFIG_DIR/jupyter_server_config.json"
-    [ -f "$pw_file" ] && python3 -c "
+    # Jupyter Server 2.x writes IdentityProvider.hashed_password; older
+    # versions used ServerApp.password / NotebookApp.password. Users may
+    # also hand-configure in jupyter_server_config.py.
+    local json_file="$JUPYTER_CONFIG_DIR/jupyter_server_config.json"
+    local py_file="$JUPYTER_CONFIG_DIR/jupyter_server_config.py"
+    if [ -f "$json_file" ] && python3 -c "
 import json, sys
 d = json.load(open(sys.argv[1]))
-pwd = d.get('ServerApp', d.get('NotebookApp', {})).get('password', '')
-sys.exit(0 if pwd else 1)
-" "$pw_file" 2>/dev/null
+def get(section, key):
+    return d.get(section, {}).get(key) or ''
+if (get('IdentityProvider', 'hashed_password')
+        or get('PasswordIdentityProvider', 'hashed_password')
+        or get('ServerApp', 'password')
+        or get('NotebookApp', 'password')):
+    sys.exit(0)
+sys.exit(1)
+" "$json_file" 2>/dev/null; then
+        return 0
+    fi
+    if [ -f "$py_file" ] && grep -Eq \
+        '^[[:space:]]*c\.(IdentityProvider|PasswordIdentityProvider)\.hashed_password[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']+["'"'"']|^[[:space:]]*c\.(ServerApp|NotebookApp)\.password[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']+["'"'"']' \
+        "$py_file"; then
+        return 0
+    fi
+    return 1
 }
 
 # Parse --https, --port, and pass-through args for start/serve commands.

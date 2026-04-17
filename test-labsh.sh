@@ -264,6 +264,87 @@ test_labsh_help() {
 }
 run_test "labsh help prints usage" test_labsh_help
 
+# --- password detection (no warning when password is configured) ---
+
+# Source check_password_set from bin/labsh so we can exercise it directly.
+# shellcheck disable=SC1090
+source <(sed -n '/^check_password_set() {$/,/^}$/p' "$LAB")
+
+test_password_no_config() {
+    local cfg="$UNIT_WORK_DIR/pwcheck-empty"
+    rm -rf "$cfg" && mkdir -p "$cfg"
+    ! JUPYTER_CONFIG_DIR="$cfg" check_password_set
+}
+run_test "check_password_set: no config -> unset" test_password_no_config
+
+test_password_identity_provider_json() {
+    local cfg="$UNIT_WORK_DIR/pwcheck-ip"
+    rm -rf "$cfg" && mkdir -p "$cfg"
+    cat > "$cfg/jupyter_server_config.json" <<'JSON'
+{"IdentityProvider": {"hashed_password": "argon2:$argon2id$v=19$x"}}
+JSON
+    JUPYTER_CONFIG_DIR="$cfg" check_password_set
+}
+run_test "check_password_set: IdentityProvider.hashed_password (Jupyter Server 2.x)" \
+    test_password_identity_provider_json
+
+test_password_legacy_server_app_json() {
+    local cfg="$UNIT_WORK_DIR/pwcheck-sa"
+    rm -rf "$cfg" && mkdir -p "$cfg"
+    cat > "$cfg/jupyter_server_config.json" <<'JSON'
+{"ServerApp": {"password": "sha1:abcdef"}}
+JSON
+    JUPYTER_CONFIG_DIR="$cfg" check_password_set
+}
+run_test "check_password_set: legacy ServerApp.password" \
+    test_password_legacy_server_app_json
+
+test_password_empty_fields() {
+    local cfg="$UNIT_WORK_DIR/pwcheck-empty-fields"
+    rm -rf "$cfg" && mkdir -p "$cfg"
+    cat > "$cfg/jupyter_server_config.json" <<'JSON'
+{"IdentityProvider": {"hashed_password": ""}, "ServerApp": {"password": ""}}
+JSON
+    ! JUPYTER_CONFIG_DIR="$cfg" check_password_set
+}
+run_test "check_password_set: empty password fields -> unset" \
+    test_password_empty_fields
+
+test_password_unrelated_json() {
+    # Regression: a config file with only non-password keys must not
+    # report a password as set.
+    local cfg="$UNIT_WORK_DIR/pwcheck-other"
+    rm -rf "$cfg" && mkdir -p "$cfg"
+    cat > "$cfg/jupyter_server_config.json" <<'JSON'
+{"MappingKernelManager": {"kernel_info_timeout": 120}}
+JSON
+    ! JUPYTER_CONFIG_DIR="$cfg" check_password_set
+}
+run_test "check_password_set: unrelated config keys -> unset" \
+    test_password_unrelated_json
+
+test_password_python_config() {
+    local cfg="$UNIT_WORK_DIR/pwcheck-py"
+    rm -rf "$cfg" && mkdir -p "$cfg"
+    cat > "$cfg/jupyter_server_config.py" <<'PY'
+c.IdentityProvider.hashed_password = 'argon2:$argon2id$xyz'
+PY
+    JUPYTER_CONFIG_DIR="$cfg" check_password_set
+}
+run_test "check_password_set: Python config IdentityProvider.hashed_password" \
+    test_password_python_config
+
+test_password_python_commented() {
+    local cfg="$UNIT_WORK_DIR/pwcheck-py-comment"
+    rm -rf "$cfg" && mkdir -p "$cfg"
+    cat > "$cfg/jupyter_server_config.py" <<'PY'
+# c.IdentityProvider.hashed_password = 'argon2:xxx'
+PY
+    ! JUPYTER_CONFIG_DIR="$cfg" check_password_set
+}
+run_test "check_password_set: commented Python config -> unset" \
+    test_password_python_commented
+
 echo
 echo "test-labsh: unit tests done — $pass/$total passed"
 echo
