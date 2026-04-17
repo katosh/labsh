@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.3.0] - 2026-04-17
+
+### Changed — security posture
+
+- **Default bind is now `0.0.0.0`** (was `127.0.0.1`). Matches the typical
+  HPC use case of accessing the notebook from another machine on the
+  institute network. Override with `--ip 127.0.0.1` or `IP=127.0.0.1`.
+- **Stable auth token** at `.jupyter/token` (mode `0600`). Generated once
+  per project, persists across restarts, passed to Jupyter via the
+  `JUPYTER_TOKEN` env var so it does **not** appear in `ps` output on
+  multi-user machines. Any on-machine process with read access to the
+  file can authenticate without coordination.
+- **Loud warning** when binding publicly over plain HTTP, recommending
+  `--https`. The warning fires regardless of password state because a
+  plain-HTTP token still travels in cleartext.
+- Auto-writes `.jupyter/.gitignore` covering `token`, runtime state, and
+  `jupyter_server_config.json` so secrets don't accidentally get committed.
+
+### Added
+
+- **`labsh token`:** Print / rotate / locate the stable auth token.
+  - `labsh token` — print (create on first call)
+  - `labsh token --rotate` — regenerate; restart server to apply
+  - `labsh token --path` — print absolute path of the token file
+
 ## [0.2.2] - 2026-04-17
 
 ### Fixed

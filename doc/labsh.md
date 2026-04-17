@@ -51,18 +51,42 @@ labsh start --port 9012     # background
 If the requested port is in use, `labsh` auto-increments and tries up to 10
 consecutive ports before failing.
 
-**HTTPS access.** For remote access over HTTPS with auto-generated
-self-signed certs:
+**Default bind.** labsh binds to `0.0.0.0` by default — reachable from
+other machines on the local network. Override with `--ip 127.0.0.1`
+(or `IP=127.0.0.1`) for localhost-only.
+
+**Stable auth token.** On first start labsh writes a random token to
+`.jupyter/token` (mode `0600`) and passes it to Jupyter via the
+`JUPYTER_TOKEN` env var. The token persists across restarts, and the env
+var handoff keeps it out of `ps` output on multi-user machines.
 
 ```bash
-labsh start --https                   # binds 0.0.0.0, generates cert
+labsh token                           # print the token
+labsh token --rotate                  # regenerate (restart server to apply)
+labsh token --path                    # .../.jupyter/token
+TOKEN=$(labsh token)
+curl -H "Authorization: token $TOKEN" http://localhost:8888/api/status
+```
+
+Any on-machine process that can read `.jupyter/token` can authenticate to
+the server — handy for agents and scripts that need to drive the kernel
+programmatically.
+
+**Password (optional).** `labsh password` sets a browser-friendly
+password on top of the token. Password and token coexist; clients may
+use either.
+
+**HTTPS access.** Plain HTTP on a public bind sends the token in
+cleartext. Strongly recommended when binding off localhost:
+
+```bash
+labsh start --https                   # auto-generates cert in .jupyter/ssl/
 labsh start --https --port 9012       # custom port
 labsh --https --ip 127.0.0.1          # foreground, localhost-only HTTPS
 ```
 
 `--https` generates a self-signed certificate under `.jupyter/ssl/` if
-none exists, and defaults to binding `0.0.0.0`. Set a persistent password
-with `labsh password` or rely on the auto-generated token.
+none exists.
 
 **Getting the URL.** Use `labsh url` to print the running server's full
 access URL (with token) at any time:
@@ -88,6 +112,8 @@ ssh -L 8888:localhost:8888 user@host
 | `labsh stop`             | SIGTERM the labsh server owning this project |
 | `labsh status`           | Show running servers and kernels |
 | `labsh url`              | Print the running server's access URL (with token) |
+| `labsh token [--rotate\|--path]` | Print, rotate, or locate the stable auth token at `.jupyter/token` |
+| `labsh password`         | Set a persistent password (optional, coexists with token) |
 
 ### Kernelspec management
 

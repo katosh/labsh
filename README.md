@@ -72,7 +72,8 @@ labsh kernel exec -n analysis.ipynb "df.describe()"
 | `labsh stop` | Stop the server |
 | `labsh status` | Show running servers and kernels |
 | `labsh url` | Print the server access URL (with token) |
-| `labsh password` | Set a persistent password |
+| `labsh token [--rotate\|--path]` | Print, rotate, or locate the stable auth token |
+| `labsh password` | Set a persistent password (optional) |
 
 ### Kernel management
 
@@ -104,17 +105,33 @@ labsh kernel exec -n analysis.ipynb "df.describe()"
 | `labsh notebook append [-n PATH] [--execute] CODE` | Append a cell |
 | `labsh notebook replace [-n PATH] IDX [--execute] CODE` | Replace a cell |
 
-## HTTPS and Port Selection
+## Network, Auth, and HTTPS
+
+labsh binds to `0.0.0.0` by default — reachable from other machines on
+the local network. Override with `--ip 127.0.0.1` for localhost-only.
+
+A stable auth token is generated on first start and written to
+`.jupyter/token` (mode `0600`). It persists across restarts and is passed
+to Jupyter via `JUPYTER_TOKEN` so it never appears in `ps` output.
+On-machine agents can read the file directly:
 
 ```bash
-labsh start --https                   # auto-generates self-signed cert, binds 0.0.0.0
+TOKEN=$(labsh token)
+curl -H "Authorization: token $TOKEN" "$(labsh url | sed 's#/lab.*##')/api/status"
+```
+
+Plain HTTP with a public bind leaks the token on every request. For
+remote access, use HTTPS (self-signed certs auto-generated):
+
+```bash
+labsh start --https                   # auto-generates cert, binds 0.0.0.0
 labsh start --https --port 9012       # custom port
 labsh start --port 9012               # HTTP, custom port
 ```
 
-When a port is in use, `labsh` auto-increments up to 10 times. Set a
-persistent password with `labsh password` or rely on the auto-generated
-token. Use `labsh url` to retrieve the URL later.
+When a port is in use, `labsh` auto-increments up to 10 times.
+`labsh password` optionally layers a browser-friendly password on top of
+the token. Use `labsh url` to retrieve the full URL later.
 
 ## NFS Performance
 

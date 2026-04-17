@@ -345,6 +345,65 @@ PY
 run_test "check_password_set: commented Python config -> unset" \
     test_password_python_commented
 
+# --- stable auth token ---
+
+test_token_creates_and_prints() {
+    local d="$UNIT_WORK_DIR/tok-create"
+    mkdir -p "$d"
+    local tok
+    tok="$(cd "$d" && "$LAB" token)"
+    # 48-char hex token
+    [ "${#tok}" -ge 32 ] && [ -f "$d/.jupyter/token" ]
+}
+run_test "labsh token creates and prints 48-char hex" test_token_creates_and_prints
+
+test_token_is_stable() {
+    local d="$UNIT_WORK_DIR/tok-stable"
+    mkdir -p "$d"
+    local a b
+    a="$(cd "$d" && "$LAB" token)"
+    b="$(cd "$d" && "$LAB" token)"
+    [ "$a" = "$b" ]
+}
+run_test "labsh token returns same value across calls" test_token_is_stable
+
+test_token_file_is_mode_0600() {
+    local d="$UNIT_WORK_DIR/tok-perms"
+    mkdir -p "$d"
+    (cd "$d" && "$LAB" token >/dev/null)
+    local mode
+    mode="$(stat -c '%a' "$d/.jupyter/token" 2>/dev/null || stat -f '%Lp' "$d/.jupyter/token")"
+    [ "$mode" = "600" ]
+}
+run_test "labsh token file is mode 0600" test_token_file_is_mode_0600
+
+test_token_rotate_changes_value() {
+    local d="$UNIT_WORK_DIR/tok-rotate"
+    mkdir -p "$d"
+    local a b
+    a="$(cd "$d" && "$LAB" token)"
+    b="$(cd "$d" && "$LAB" token --rotate)"
+    [ -n "$a" ] && [ -n "$b" ] && [ "$a" != "$b" ]
+}
+run_test "labsh token --rotate changes the value" test_token_rotate_changes_value
+
+test_token_path_prints_file() {
+    local d="$UNIT_WORK_DIR/tok-path"
+    mkdir -p "$d"
+    local p
+    p="$(cd "$d" && "$LAB" token --path)"
+    [ "$p" = "$d/.jupyter/token" ]
+}
+run_test "labsh token --path prints the token file path" test_token_path_prints_file
+
+test_token_gitignore_written() {
+    local d="$UNIT_WORK_DIR/tok-gi"
+    mkdir -p "$d"
+    (cd "$d" && "$LAB" token >/dev/null)
+    grep -qE '^token$' "$d/.jupyter/.gitignore"
+}
+run_test "labsh token drops a .jupyter/.gitignore" test_token_gitignore_written
+
 echo
 echo "test-labsh: unit tests done — $pass/$total passed"
 echo
