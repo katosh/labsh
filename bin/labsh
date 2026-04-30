@@ -93,7 +93,7 @@ clicking through the web UI.
 USAGE
   labsh                          Start JupyterLab in the current directory
                                (foreground; typical when run in a tmux pane)
-  labsh start [--https] [--port N] [--ip ADDR]
+  labsh start [--https] [--port N] [--ip ADDR] [--with-ai]
                                Start JupyterLab in the background, log to
                                ./.jupyter/labsh.bg.log, return immediately
   labsh stop                     Stop a background JupyterLab owning this project
@@ -186,11 +186,23 @@ NFS PERFORMANCE
   The /tmp venvs are ephemeral (lost on reboot).  `labsh kernel add` or
   `labsh start` recreates them automatically when needed.
 
+AI EXTENSION (notebook-intelligence)
+  Off by default. The package pulls `tiktoken`, which only ships
+  manylinux_2_28 wheels — on hosts with glibc < 2.28 (Ubuntu 18.04,
+  RHEL 7) the source build needs Rust 1.85+ and routinely fails. To
+  enable when the host can install it cleanly:
+
+    labsh start --with-ai          # one-off
+    LABSH_AI=1 labsh start         # via env (e.g. exported in ~/.bashrc)
+
+  `--no-ai` overrides `LABSH_AI=1` from the CLI.
+
 ENVIRONMENT VARIABLES
   PORT, IP                     Defaults for --port / --ip
   JUPYTER_CERTFILE/KEYFILE     TLS cert / key (enables HTTPS if both set)
   JUPYTER_CONFIG_DIR           default: ./.jupyter
   JUPYTER_DATA_DIR             default: ./.jupyter/share/jupyter
+  LABSH_AI                     1/true → enable notebook-intelligence
   UV_CACHE_DIR                 default: /tmp/uv-cache-$UID
   UV_LINK_MODE                 default: copy
 
@@ -599,8 +611,9 @@ sys.exit(1)
     return 1
 }
 
-# Parse --https, --port, and pass-through args for start/serve commands.
-# Sets: USE_HTTPS, RESOLVED_PORT, RESOLVED_IP, TLS_ARGS, PASSTHROUGH_ARGS
+# Parse --https, --port, --with-ai, and pass-through args for start/serve.
+# Sets: USE_HTTPS, RESOLVED_PORT, RESOLVED_IP, TLS_ARGS, PASSTHROUGH_ARGS,
+#       WITH_AI, WITH_ARGS.
 parse_server_flags() {
     USE_HTTPS=0
     RESOLVED_PORT="${PORT:-8888}"
@@ -611,10 +624,26 @@ parse_server_flags() {
     TLS_ARGS=()
     PASSTHROUGH_ARGS=()
 
+    # AI extension (notebook-intelligence) is opt-in. It pulls tiktoken,
+    # which only ships manylinux_2_28 wheels — on glibc 2.27 hosts the
+    # source build needs Rust 1.85+ and routinely fails. Default off so
+    # `labsh start` works out of the box; opt in via `--with-ai` or
+    # `LABSH_AI=1`. `--no-ai` overrides the env var on the CLI.
+    WITH_AI=0
+    case "${LABSH_AI:-}" in
+        1|true|TRUE|yes|YES|on|ON) WITH_AI=1 ;;
+    esac
+
     while [ $# -gt 0 ]; do
         case "$1" in
             --https)
                 USE_HTTPS=1
+                shift ;;
+            --with-ai)
+                WITH_AI=1
+                shift ;;
+            --no-ai)
+                WITH_AI=0
                 shift ;;
             --port)
                 [ -n "${2:-}" ] || die "start: --port requires a value"
@@ -635,6 +664,17 @@ parse_server_flags() {
                 shift ;;
         esac
     done
+
+    WITH_ARGS=(
+        --with jupyterlmod
+        --with jupyterlab_notify
+        --with jupyterlab_execute_time
+        --with jupyter-resource-usage
+        --with jupyterlab-widgets
+    )
+    if [ "$WITH_AI" -eq 1 ]; then
+        WITH_ARGS+=(--with notebook-intelligence)
+    fi
 
     if [ "$USE_HTTPS" -eq 1 ]; then
         ensure_ssl_cert
@@ -682,12 +722,7 @@ cmd_start() {
     export JUPYTER_TOKEN
 
     uvx --python "$LAB_PYTHON" --from jupyterlab \
-        --with jupyterlmod \
-        --with jupyterlab_notify \
-        --with jupyterlab_execute_time \
-        --with jupyter-resource-usage \
-        --with jupyterlab-widgets \
-        --with notebook-intelligence \
+        "${WITH_ARGS[@]}" \
         jupyter-lab \
         --port "$RESOLVED_PORT" \
         --ip "$RESOLVED_IP" \
@@ -839,12 +874,7 @@ cmd_serve() {
     export JUPYTER_TOKEN
 
     exec uvx --python "$LAB_PYTHON" --from jupyterlab \
-        --with jupyterlmod \
-        --with jupyterlab_notify \
-        --with jupyterlab_execute_time \
-        --with jupyter-resource-usage \
-        --with jupyterlab-widgets \
-        --with notebook-intelligence \
+        "${WITH_ARGS[@]}" \
         jupyter-lab \
         --port "$RESOLVED_PORT" \
         --ip "$RESOLVED_IP" \
