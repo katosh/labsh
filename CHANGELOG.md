@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0] - 2026-04-30
+
+### Changed — startup stability
+
+- **`notebook-intelligence` is now opt-in.** The previous default pulled
+  `tiktoken`, which only ships `manylinux_2_28` wheels — on hosts with
+  glibc < 2.28 (Ubuntu 18.04, RHEL 7, the agent-sandbox) the source build
+  needs Rust 1.85+ and routinely fails, so `labsh start` failed out of the
+  box. With this release `labsh start` works on any host that can install
+  the base JupyterLab stack.
+
+### Added
+
+- **`--with-ai` flag and `LABSH_AI=1` env var** to enable the
+  `notebook-intelligence` extension. `--no-ai` overrides `LABSH_AI=1` on
+  the CLI.
+
 ## [0.3.0] - 2026-04-17
 
 ### Changed — security posture

@@ -68,7 +68,7 @@ labsh kernel exec -n analysis.ipynb "df.describe()"
 | Command | Description |
 |---------|-------------|
 | `labsh` | Run JupyterLab in foreground |
-| `labsh start [--https] [--port N] [--ip ADDR]` | Start in background |
+| `labsh start [--https] [--port N] [--ip ADDR] [--with-ai]` | Start in background |
 | `labsh stop` | Stop the server |
 | `labsh status` | Show running servers and kernels |
 | `labsh url` | Print the server access URL (with token) |
@@ -132,6 +132,22 @@ labsh start --port 9012               # HTTP, custom port
 When a port is in use, `labsh` auto-increments up to 10 times.
 `labsh password` optionally layers a browser-friendly password on top of
 the token. Use `labsh url` to retrieve the full URL later.
+
+## AI Extension (opt-in)
+
+`labsh` can launch JupyterLab with the
+[`notebook-intelligence`](https://github.com/notebook-intelligence/notebook-intelligence)
+extension. It is **off by default** because the package pulls `tiktoken`,
+which only ships `manylinux_2_28` wheels — on hosts with glibc < 2.28
+(Ubuntu 18.04, RHEL 7) the source build needs Rust 1.85+ and routinely
+fails. Keeping it opt-in means `labsh start` works out of the box on any
+host that can install the base JupyterLab stack.
+
+```bash
+labsh start --with-ai           # enable for one run
+LABSH_AI=1 labsh start          # enable via env (e.g. ~/.bashrc)
+LABSH_AI=1 labsh start --no-ai  # CLI override wins
+```
 
 ## NFS Performance
 
