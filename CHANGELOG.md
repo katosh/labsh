@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.4.1] - 2026-05-07
+
+### Fixed — kernels built against Lmod-managed Python die on startup
+
+`labsh kernel add` (and bare `python -m ipykernel install`) wrote a
+`kernel.json` with no `env` block. When the venv's Python comes from
+an Lmod module — realpath under `/app/software/...`, e.g.
+`Python/3.12.3-GCCcore-13.3.0` — the dynamic loader couldn't find
+`libpython*.so.*` (or the matching OpenSSL / libffi / SQLite runtime
+libs) and the kernel died with **"Kernel died before replying to
+kernel_info"**. This commonly surfaced as "labsh notebook attach
+doesn't accept `--kernel`" — the flag was fine; the kernel just
+couldn't start.
+
+`kernel add` now detects an Lmod-managed Python and bakes the
+registering shell's `$LD_LIBRARY_PATH` into `kernel.json`'s `env`
+block. No-op on non-Lmod hosts.
+
+### Added — `labsh kernel register` for external venvs
+
+```
+labsh kernel register --project DIR [--name NAME] [--display-name DISP]
+                      [--ld-library-path PATHS] [--notebook PATH]
+                      [--no-attach]
+```
+
+Registers an existing venv at `DIR/.venv` as a kernelspec under the
+current labsh project's `.jupyter/share/jupyter/kernels/<NAME>/`,
+with `LD_LIBRARY_PATH` baked into `kernel.json` for Lmod pythons.
+Auto-installs `ipykernel` into the venv if missing.
+
+With `--notebook PATH`, also pins `metadata.kernelspec.name=<NAME>`
+into the notebook (creating a fresh `nbformat`-v4 file if missing)
+and calls `labsh notebook attach PATH --kernel-name <NAME>` unless
+`--no-attach`.
+
+Closes [#2](https://github.com/katosh/labsh/issues/2).
+
 ## [0.4.0] - 2026-04-30
 
 ### Changed — startup stability
