@@ -107,6 +107,12 @@ USAGE
   labsh kernel add [NAME] [PKGS...]
                                Create ./.venv, register it as a kernelspec,
                                and install PKGS (e.g. pandas numpy)
+  labsh kernel register --project DIR [--name N] [--notebook PATH]
+                               Register an EXISTING venv (DIR/.venv) as a
+                               kernelspec under this labsh project; bakes
+                               $LD_LIBRARY_PATH into kernel.json for
+                               Lmod-built pythons. With --notebook, also
+                               pins notebook metadata + attaches.
   labsh kernel install PKGS...   Install packages into the kernel .venv
   labsh kernel shell             Enter a subshell with .venv activated
   labsh kernel run [--] CMD...   Run a command inside the .venv
@@ -232,6 +238,84 @@ sanitize_kernel_name() {
     # Lowercase; collapse runs of non-[a-z0-9._-] into '-'; trim leading/trailing '-'.
     printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
         | sed -e 's/[^a-z0-9._-]\+/-/g' -e 's/^-\+//' -e 's/-\+$//'
+}
+
+is_lmod_python() {
+    # Lmod-managed pythons (and their library trees) live under
+    # /app/software/. Without LD_LIBRARY_PATH baked into kernel.json, the
+    # kernel's dynamic loader can't find libpython*.so.* and the kernel
+    # dies with "Kernel died before replying to kernel_info".
+    local py="$1" real
+    real="$(readlink -f "$py" 2>/dev/null)" || return 1
+    case "$real" in
+        /app/software/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+resolve_kernel_ld_library_path() {
+    # Echo the LD_LIBRARY_PATH to bake into kernel.json (or empty).
+    # Args: <python-path> [<override-set 0|1> <override-value>]
+    # Behavior:
+    #   override-set=1: use override-value verbatim (empty string clears).
+    #   else, if python is Lmod-managed: require $LD_LIBRARY_PATH set, bake it.
+    #   else: empty (don't bake).
+    local py="$1" override_set="${2:-0}" override="${3-}"
+    if [ "$override_set" = "1" ]; then
+        printf '%s' "$override"
+        return 0
+    fi
+    if is_lmod_python "$py"; then
+        if [ -z "${LD_LIBRARY_PATH:-}" ]; then
+            die "venv python at $py is from /app/software/ (Lmod) but \$LD_LIBRARY_PATH is empty — \`module load\` the matching Python module (or pass --ld-library-path PATHS) so the kernel can find libpython*.so at startup"
+        fi
+        printf '%s' "$LD_LIBRARY_PATH"
+        return 0
+    fi
+    printf ''
+}
+
+patch_kernel_json_ld() {
+    # Add env.LD_LIBRARY_PATH to a kernel.json. No-op if value is empty.
+    local spec="$1" ld="$2"
+    [ -n "$ld" ] || return 0
+    [ -f "$spec" ] || die "cannot patch kernel.json: $spec missing"
+    LABSH_LD="$ld" python3 - "$spec" <<'PYEOF'
+import json, os, sys
+p = sys.argv[1]
+with open(p) as fh:
+    d = json.load(fh)
+d.setdefault("env", {})["LD_LIBRARY_PATH"] = os.environ["LABSH_LD"]
+with open(p, "w") as fh:
+    json.dump(d, fh, indent=2)
+    fh.write("\n")
+PYEOF
+}
+
+pin_notebook_kernel() {
+    # Pin metadata.kernelspec.name to NAME in NB; create a fresh empty
+    # nbformat-v4 notebook if missing.
+    local nb="$1" name="$2" display="$3"
+    LABSH_NB="$nb" LABSH_NAME="$name" LABSH_DISPLAY="$display" python3 - <<'PYEOF'
+import json, os
+nb_path = os.environ["LABSH_NB"]
+name = os.environ["LABSH_NAME"]
+display = os.environ["LABSH_DISPLAY"]
+if os.path.isfile(nb_path):
+    with open(nb_path) as fh:
+        nb = json.load(fh)
+else:
+    parent = os.path.dirname(nb_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    nb = {"cells": [], "metadata": {}, "nbformat": 4, "nbformat_minor": 5}
+nb.setdefault("metadata", {})["kernelspec"] = {
+    "display_name": display, "language": "python", "name": name,
+}
+with open(nb_path, "w") as fh:
+    json.dump(nb, fh, indent=1)
+    fh.write("\n")
+PYEOF
 }
 
 ensure_venv_with_ipykernel() {
@@ -376,11 +460,140 @@ cmd_kernel_add() {
     ensure_venv_with_ipykernel "$@"  # pass extra packages through
     ensure_lab_venv                  # ensure labsh helper venv exists too
     mkdir -p "$JUPYTER_CONFIG_DIR"
+    local ld
+    ld="$(resolve_kernel_ld_library_path "$VENV_DIR/bin/python")"
     "$VENV_DIR/bin/python" -m ipykernel install \
         --prefix "$JUPYTER_CONFIG_DIR" \
         --name "$name" \
         --display-name "$name (.venv)"
+    local spec="$KERNELS_DIR/$name/kernel.json"
+    patch_kernel_json_ld "$spec" "$ld"
     echo "$PROG: registered kernel '$name' → $KERNELS_DIR/$name" >&2
+    if [ -n "$ld" ]; then
+        echo "$PROG: kernel.json env.LD_LIBRARY_PATH baked in (Lmod-managed python)" >&2
+    fi
+}
+
+cmd_kernel_register() {
+    # Usage: labsh kernel register --project DIR [--name NAME]
+    #                              [--display-name DISP]
+    #                              [--ld-library-path PATHS]
+    #                              [--notebook PATH] [--no-attach]
+    #
+    # Register an EXISTING venv (DIR/.venv) as a kernelspec under the
+    # current labsh project. Bakes $LD_LIBRARY_PATH into kernel.json
+    # for Lmod-managed pythons so the kernel can find libpython*.so at
+    # startup. With --notebook, also pins metadata.kernelspec.name and
+    # calls `notebook attach` (unless --no-attach).
+    local project="" raw_name="" display=""
+    local ld_override="" ld_override_set=0
+    local notebook="" no_attach=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --project)        [ -n "${2:-}" ] || die "kernel register: --project requires a value"
+                              project="$2"; shift 2 ;;
+            --project=*)      project="${1#--project=}"; shift ;;
+            --name)           [ -n "${2:-}" ] || die "kernel register: --name requires a value"
+                              raw_name="$2"; shift 2 ;;
+            --name=*)         raw_name="${1#--name=}"; shift ;;
+            --display-name)   [ -n "${2:-}" ] || die "kernel register: --display-name requires a value"
+                              display="$2"; shift 2 ;;
+            --display-name=*) display="${1#--display-name=}"; shift ;;
+            --ld-library-path)
+                              ld_override_set=1; ld_override="${2-}"; shift 2 ;;
+            --ld-library-path=*)
+                              ld_override_set=1; ld_override="${1#--ld-library-path=}"; shift ;;
+            --notebook)       [ -n "${2:-}" ] || die "kernel register: --notebook requires a value"
+                              notebook="$2"; shift 2 ;;
+            --notebook=*)     notebook="${1#--notebook=}"; shift ;;
+            --no-attach)      no_attach=1; shift ;;
+            -h|--help)        cat <<'KRHELP'
+labsh kernel register — register an existing project venv as a kernelspec.
+
+USAGE
+  labsh kernel register --project DIR [--name NAME] [--display-name DISP]
+                        [--ld-library-path PATHS] [--notebook PATH]
+                        [--no-attach]
+
+Run from a labsh project root (where you invoked `labsh start`,
+containing .jupyter/). The kernelspec is written under
+.jupyter/share/jupyter/kernels/<NAME>/, and `kernel.json` gets an
+`env` block with $LD_LIBRARY_PATH baked in so kernels built against an
+Lmod-managed Python (realpath under /app/software/) don't die at
+startup with "Kernel died before replying to kernel_info".
+
+OPTIONS
+  --project DIR             Directory containing .venv/ (required)
+  --name NAME               Kernelspec name (default: basename of DIR)
+  --display-name DISP       Display name (default: "Python (NAME)")
+  --ld-library-path PATHS   Override LD_LIBRARY_PATH baked into kernel.json
+                            (default: $LD_LIBRARY_PATH if the venv's python
+                            is from /app/software/, else unset). Pass
+                            an empty string to skip baking entirely.
+  --notebook PATH           Pin metadata.kernelspec.name to NAME in PATH
+                            (creates a fresh notebook if missing). Then
+                            calls `labsh notebook attach PATH --kernel-name
+                            NAME` unless --no-attach.
+  --no-attach               Skip the final `labsh notebook attach` call.
+KRHELP
+                              return 0 ;;
+            *) die "kernel register: unknown arg '$1' (try '$PROG kernel register --help')" ;;
+        esac
+    done
+    [ -n "$project" ] || die "kernel register: --project DIR is required (try '$PROG kernel register --help')"
+    local project_abs
+    project_abs="$(cd "$project" 2>/dev/null && pwd)" \
+        || die "kernel register: --project '$project' is not a directory"
+    local py="$project_abs/.venv/bin/python"
+    [ -x "$py" ] || die "kernel register: no venv at $project_abs/.venv (expected $py)"
+
+    local name
+    name="$(sanitize_kernel_name "${raw_name:-$(basename "$project_abs")}")"
+    [ -n "$name" ] || die "kernel register: empty name after sanitization"
+    [ -n "$display" ] || display="Python ($name)"
+
+    local ld
+    ld="$(resolve_kernel_ld_library_path "$py" "$ld_override_set" "$ld_override")"
+
+    # Ensure ipykernel is importable in the venv. The check + install run
+    # with the resolved LD_LIBRARY_PATH so subprocess Python can start at
+    # all on Lmod hosts.
+    if ! LD_LIBRARY_PATH="${ld:-${LD_LIBRARY_PATH:-}}" \
+            "$py" -c "import ipykernel" >/dev/null 2>&1; then
+        require_uv
+        echo "$PROG: installing ipykernel into $project_abs/.venv" >&2
+        LD_LIBRARY_PATH="${ld:-${LD_LIBRARY_PATH:-}}" \
+            uv pip install --python "$py" --quiet ipykernel \
+            || die "kernel register: ipykernel install failed"
+    fi
+
+    mkdir -p "$JUPYTER_CONFIG_DIR"
+    LD_LIBRARY_PATH="${ld:-${LD_LIBRARY_PATH:-}}" \
+        "$py" -m ipykernel install \
+            --prefix "$JUPYTER_CONFIG_DIR" \
+            --name "$name" \
+            --display-name "$display" \
+        || die "kernel register: ipykernel install failed"
+
+    local spec="$KERNELS_DIR/$name/kernel.json"
+    [ -f "$spec" ] || die "kernel register: ipykernel install reported success but $spec is missing"
+    patch_kernel_json_ld "$spec" "$ld"
+    echo "$PROG: registered kernel '$name' → $KERNELS_DIR/$name" >&2
+    [ -n "$ld" ] && echo "$PROG: kernel.json env.LD_LIBRARY_PATH baked in" >&2
+
+    if [ -n "$notebook" ]; then
+        local nb_abs="$notebook"
+        case "$nb_abs" in /*) ;; *) nb_abs="$DIR/$notebook" ;; esac
+        pin_notebook_kernel "$nb_abs" "$name" "$display"
+        echo "$PROG: pinned $nb_abs → kernelspec '$name'" >&2
+        if [ "$no_attach" -ne 1 ]; then
+            run_helper_fast notebook attach "$nb_abs" --kernel-name "$name"
+            # run_helper_fast execs; never returns
+        fi
+    fi
+    echo "$PROG: done. Use:" >&2
+    echo "  labsh notebook attach <NB> --kernel-name $name" >&2
+    echo "  labsh kernel exec -n <NB> 'import sys; print(sys.executable)'" >&2
 }
 
 cmd_kernel_list() {
@@ -456,6 +669,7 @@ cmd_kernel() {
     [ $# -gt 0 ] && shift
     case "$sub" in
         add)         cmd_kernel_add        "$@" ;;
+        register|reg) cmd_kernel_register  "$@" ;;
         install|pip) cmd_kernel_install    "$@" ;;
         shell|sh)    cmd_kernel_shell      "$@" ;;
         run)         cmd_kernel_run        "$@" ;;
@@ -467,6 +681,9 @@ cmd_kernel() {
             cat >&2 <<'KHELP'
 Usage:
   labsh kernel add [NAME] [PKGS...]  Create ./.venv, register kernelspec, install packages
+  labsh kernel register --project DIR [--name N] [--notebook PATH] [--no-attach]
+                                     Register an EXISTING venv (DIR/.venv) as a kernelspec;
+                                     bakes $LD_LIBRARY_PATH into kernel.json for Lmod pythons.
   labsh kernel install PKGS...       Install packages into the kernel .venv
   labsh kernel shell                 Enter a subshell with .venv activated
   labsh kernel run [--] CMD...       Run a command inside the .venv

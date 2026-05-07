@@ -120,6 +120,78 @@ test_kernel_add_name_sanitization() {
 }
 run_test "kernel add sanitizes name" test_kernel_add_name_sanitization
 
+# --- kernel register ---
+
+test_kernel_register_external_venv() {
+    # Create a sibling project with its own venv, then register it from the
+    # labsh project root.
+    local proj="$UNIT_WORK_DIR/external-proj"
+    mkdir -p "$proj"
+    (cd "$proj" && uv venv .venv >/dev/null 2>&1)
+    uv pip install --python "$proj/.venv/bin/python" --quiet ipykernel >/dev/null 2>&1
+    (cd "$UNIT_WORK_DIR" && "$LAB" kernel register --project "$proj" --name extkern >/dev/null 2>&1)
+    [ -f "$UNIT_WORK_DIR/.jupyter/share/jupyter/kernels/extkern/kernel.json" ]
+}
+run_test "kernel register registers external venv" test_kernel_register_external_venv
+
+test_kernel_register_bakes_explicit_ld() {
+    # --ld-library-path forces the env block regardless of the python's path.
+    local proj="$UNIT_WORK_DIR/ld-proj"
+    mkdir -p "$proj"
+    (cd "$proj" && uv venv .venv >/dev/null 2>&1)
+    uv pip install --python "$proj/.venv/bin/python" --quiet ipykernel >/dev/null 2>&1
+    (cd "$UNIT_WORK_DIR" && "$LAB" kernel register --project "$proj" --name ldkern \
+        --ld-library-path "/fake/lib:/another/lib" >/dev/null 2>&1)
+    local spec="$UNIT_WORK_DIR/.jupyter/share/jupyter/kernels/ldkern/kernel.json"
+    python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d.get('env', {}).get('LD_LIBRARY_PATH') == '/fake/lib:/another/lib', d
+" "$spec"
+}
+run_test "kernel register bakes explicit --ld-library-path" test_kernel_register_bakes_explicit_ld
+
+test_kernel_register_default_no_ld() {
+    # On a non-Lmod python (typical CI), no LD_LIBRARY_PATH should be baked.
+    local proj="$UNIT_WORK_DIR/no-ld-proj"
+    mkdir -p "$proj"
+    (cd "$proj" && uv venv .venv >/dev/null 2>&1)
+    uv pip install --python "$proj/.venv/bin/python" --quiet ipykernel >/dev/null 2>&1
+    (cd "$UNIT_WORK_DIR" && "$LAB" kernel register --project "$proj" --name nodkern >/dev/null 2>&1)
+    local spec="$UNIT_WORK_DIR/.jupyter/share/jupyter/kernels/nodkern/kernel.json"
+    python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert 'LD_LIBRARY_PATH' not in d.get('env', {}), d
+" "$spec"
+}
+run_test "kernel register skips LD on non-Lmod python" test_kernel_register_default_no_ld
+
+test_kernel_register_pin_notebook_no_attach() {
+    # --notebook + --no-attach pins metadata.kernelspec.name without
+    # requiring a running labsh server.
+    local proj="$UNIT_WORK_DIR/pin-proj"
+    mkdir -p "$proj"
+    (cd "$proj" && uv venv .venv >/dev/null 2>&1)
+    uv pip install --python "$proj/.venv/bin/python" --quiet ipykernel >/dev/null 2>&1
+    (cd "$UNIT_WORK_DIR" && "$LAB" kernel register --project "$proj" --name pinkern \
+        --notebook explore.ipynb --no-attach >/dev/null 2>&1)
+    [ -f "$UNIT_WORK_DIR/explore.ipynb" ] && python3 -c "
+import json, sys
+nb = json.load(open(sys.argv[1]))
+assert nb['metadata']['kernelspec']['name'] == 'pinkern', nb
+" "$UNIT_WORK_DIR/explore.ipynb"
+}
+run_test "kernel register pins notebook with --no-attach" test_kernel_register_pin_notebook_no_attach
+
+test_kernel_register_missing_venv() {
+    local proj="$UNIT_WORK_DIR/missing-proj"
+    mkdir -p "$proj"
+    # No .venv created.
+    ! (cd "$UNIT_WORK_DIR" && "$LAB" kernel register --project "$proj" --name x >/dev/null 2>&1)
+}
+run_test "kernel register fails without venv" test_kernel_register_missing_venv
+
 # --- kernel list ---
 
 test_kernel_list() {
