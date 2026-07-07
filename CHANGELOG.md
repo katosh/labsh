@@ -32,6 +32,30 @@ attach/append/replace`) now interface with a running Jupyter server
 `POST /api/kernels/<id>/interrupt|restart` via the owning server;
 `interrupt` falls back to SIGINT for server-less local kernels.
 
+### Fixed — `kernel exec -n <name>` hung with empty output on a busy tree
+
+Notebook→kernel resolution (`_match_notebook`, behind `kernel
+exec`/`find`/`inspect` and the `notebook` subcommands) turned a
+basename query into candidate paths by walking the *entire* directory
+tree under `$PWD` (`PROJECT_DIR.rglob(<name>)`). Invoked from a high-up
+working directory over a large NFS tree — exactly how the root-server
+wrappers call labsh from inside a project — that walk took minutes, so
+`kernel exec -n <name>` appeared to **hang and return nothing**: the
+process was stuck globbing the filesystem during kernel *resolution*,
+before a single byte of code ever reached the kernel. `kernel ps` and
+`-k <id>` selectors were unaffected because they never glob, which is
+why discovery looked healthy while exec stalled.
+
+Resolution now matches the query against the notebook paths the kernels
+already carry (from `jupyter_session` / the server's `/api/sessions`),
+touching the filesystem at most for a single `stat`, never a recursive
+walk — the glob was redundant anyway, since a globbed path only ever
+matched a kernel whose absolute notebook path is already known here. The
+`$PWD`-scoping the walk used to provide is preserved as a tie-breaker
+when a basename matches kernels in several locations. Independent of the
+transport, so both the native websocket path and the ZMQ fallback are
+fixed.
+
 ### Changed
 
 - The labsh helper venv now also carries `websocket-client` (pure

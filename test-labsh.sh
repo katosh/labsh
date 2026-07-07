@@ -633,6 +633,49 @@ test_exec_stdin() {
 }
 run_test "kernel exec from stdin via -f -" test_exec_stdin
 
+test_exec_resolution_no_fs_walk() {
+    # Regression for the `kernel exec -n <name>` empty-output hang: notebook
+    # resolution used to glob PROJECT_DIR.rglob(<name>), an unbounded
+    # recursive walk. Invoked from a high-up cwd on a large NFS tree (exactly
+    # how the root-server wrappers call labsh) that walk took minutes, so exec
+    # appeared to hang and return nothing — before a single byte of code ever
+    # reached the kernel. Resolution must instead match the query against the
+    # notebook paths the kernels already carry, touching the filesystem at
+    # most for a single stat, never a walk. Here we booby-trap Path.rglob to
+    # raise: a basename query must still resolve to the right kernel with the
+    # walk never happening.
+    HELPER_DIR="$(dirname "$HELPER")" "$INTEG_VENV_DIR/bin/python" - <<'PY'
+import os, sys, pathlib
+sys.path.insert(0, os.environ["HELPER_DIR"])
+import _labsh_kernel as L
+
+def _boom(*a, **k):
+    raise AssertionError("notebook resolution walked the filesystem (rglob)")
+
+pathlib.Path.rglob = _boom  # any filesystem walk during resolution is a regression
+
+k = L.Kernel(
+    pid=4242,
+    username="tester",
+    connection_file=None,
+    short_id="dead1234",
+    kernelspec="python3",
+    notebook_path=pathlib.Path("/some/deep/unreachable/dir/hello.ipynb"),
+    server=None,
+    kernel_id="dead1234-0000-0000-0000-000000000000",
+)
+m = L._match_notebook([k], "hello.ipynb")
+assert len(m) == 1 and m[0].short_id == "dead1234", f"unexpected match: {m}"
+
+# Substring form must also resolve without a walk.
+m2 = L._match_notebook([k], "unreachable/dir/hello.ipynb")
+assert len(m2) == 1 and m2[0].short_id == "dead1234", f"unexpected substring match: {m2}"
+print("ok")
+PY
+}
+run_test "kernel exec resolves by known notebook path, never a filesystem walk" \
+    test_exec_resolution_no_fs_walk
+
 test_exec_auto_select() {
     # With a single running kernel, -n/-k should not be required.
     # Skip if other kernels are running (shared systems).

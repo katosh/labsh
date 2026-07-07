@@ -815,43 +815,87 @@ def _match_notebook(kernels: list[Kernel], query: str) -> list[Kernel]:
     Accepted forms:
       * absolute path                         (must match an existing kernel exactly)
       * path relative to $PWD                 (absolute-matched)
-      * basename (globbed under $PWD)
+      * basename                              (matched against known kernels)
       * substring match against the kernel's notebook path
+
+    Matching is done against the notebook paths the kernels *already* carry
+    (from jupyter_session / the server's /api/sessions) — never by walking the
+    filesystem. An earlier implementation globbed ``PROJECT_DIR.rglob(name)``
+    to turn a basename into candidate paths; from a high-up cwd (e.g. a
+    workspace root, which is exactly how the root-server wrappers invoke
+    labsh) that recursive walk of a large NFS tree took minutes and made
+    ``kernel exec -n <name>`` appear to hang with empty output. It was also
+    redundant: a globbed path only ever matched a kernel whose notebook path
+    is known here anyway, so we compare against those paths directly.
     """
     if not kernels:
         return []
 
     query_path = Path(query)
-    candidates: list[Path] = []
+
+    # Resolve the query to an absolute path *without* walking the tree:
+    #   - absolute query          -> as given
+    #   - $PWD-relative that exists -> resolved (a single stat, not a walk)
+    # Used only for exact comparison against kernels' known notebook paths.
+    abs_query: Path | None = None
     if query_path.is_absolute():
-        candidates.append(query_path.resolve())
+        abs_query = query_path.resolve()
     else:
         rel = (PROJECT_DIR / query_path).resolve()
         if rel.exists():
-            candidates.append(rel)
-        # glob on basename under project dir
-        for hit in PROJECT_DIR.rglob(query_path.name):
-            candidates.append(hit.resolve())
-
-    def by_abs(abs_path: Path) -> list[Kernel]:
-        return [
-            k
-            for k in kernels
-            if k.notebook_path is not None and k.notebook_path == abs_path
-        ]
+            abs_query = rel
 
     matches: list[Kernel] = []
     seen: set[tuple] = set()
-    for c in candidates:
-        for k in by_abs(c):
-            if _kernel_key(k) not in seen:
-                matches.append(k)
-                seen.add(_kernel_key(k))
+
+    def add(k: Kernel) -> None:
+        if _kernel_key(k) not in seen:
+            matches.append(k)
+            seen.add(_kernel_key(k))
+
+    # 1. Exact absolute match against known kernel notebook paths.
+    if abs_query is not None:
+        for k in kernels:
+            if k.notebook_path is not None and k.notebook_path == abs_query:
+                add(k)
+        if matches:
+            return matches
+
+    # 2. Basename match against known kernel notebook paths (no fs walk). If a
+    #    basename matches kernels in several locations, prefer those under the
+    #    current project dir — parity with the old glob-under-$PWD scoping —
+    #    before surfacing the ambiguity to the caller.
+    qname = query_path.name
+    basename_hits = [
+        k
+        for k in kernels
+        if k.notebook_path is not None and k.notebook_path.name == qname
+    ]
+    if len(basename_hits) > 1:
+        def _under_project(p: Path) -> bool:
+            try:
+                p.relative_to(PROJECT_DIR)
+            except ValueError:
+                return False
+            return True
+
+        scoped = [
+            k
+            for k in basename_hits
+            if k.notebook_path is not None and _under_project(k.notebook_path)
+        ]
+        if scoped:
+            basename_hits = scoped
+    for k in basename_hits:
+        add(k)
     if matches:
         return matches
 
-    # Substring fallback against the notebook path
+    # 3. Substring fallback against the notebook path.
     q_lower = query.lower()
+    # Pure path computation (resolve() needs no filesystem), used only to let a
+    # $PWD-relative query match a served path given relative to an unknown
+    # server root (explicit --server URL).
     q_abs_lower = str(
         (query_path if query_path.is_absolute() else PROJECT_DIR / query_path).resolve()
     ).lower()
@@ -869,8 +913,7 @@ def _match_notebook(kernels: list[Kernel], query: str) -> list[Kernel]:
                 or q_abs_lower.endswith("/" + nb_lower)
             )
         if hit:
-            matches.append(k)
-            seen.add(_kernel_key(k))
+            add(k)
     return matches
 
 
