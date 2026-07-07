@@ -476,6 +476,54 @@ test_token_gitignore_written() {
 }
 run_test "labsh token drops a .jupyter/.gitignore" test_token_gitignore_written
 
+# --- server env --with composition ---
+
+# Source parse_server_flags from bin/labsh to exercise how the server-env
+# package list is assembled: baseline (must ship pip for the in-UI
+# Extension Manager), the LABSH_WITH seam, and specs persisted by
+# `labsh ext install`.
+# shellcheck disable=SC1090
+source <(sed -n '/^parse_server_flags() {$/,/^}$/p' "$LAB")
+PROG=labsh
+die() { echo "die: $*" >&2; return 1; }
+find_available_port() { echo "$1"; }
+
+with_args_contain() {
+    local needle="$1"
+    case " ${WITH_ARGS[*]-} " in
+        *" --with $needle "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+test_with_args_ship_pip() {
+    EXT_FILE="/nonexistent" LABSH_WITH= IP=127.0.0.1 parse_server_flags
+    with_args_contain pip
+}
+run_test "server env: baseline --with list ships pip" test_with_args_ship_pip
+
+test_with_args_labsh_with_seam() {
+    EXT_FILE="/nonexistent" LABSH_WITH="pkg-a pkg-b" IP=127.0.0.1 \
+        parse_server_flags
+    with_args_contain pkg-a && with_args_contain pkg-b
+}
+run_test "server env: LABSH_WITH packages become --with args" \
+    test_with_args_labsh_with_seam
+
+test_with_args_persisted_extensions() {
+    local d="$UNIT_WORK_DIR/withargs-ext"
+    mkdir -p "$d"
+    printf 'jupyterlab-vim\n# a comment\n\njupyterlab-git==0.50.0\n' \
+        > "$d/labsh-extensions"
+    EXT_FILE="$d/labsh-extensions" LABSH_WITH= IP=127.0.0.1 \
+        parse_server_flags
+    with_args_contain jupyterlab-vim \
+        && with_args_contain "jupyterlab-git==0.50.0" \
+        && ! with_args_contain "# a comment"
+}
+run_test "server env: persisted ext specs included, comments skipped" \
+    test_with_args_persisted_extensions
+
 echo
 echo "test-labsh: unit tests done — $pass/$total passed"
 echo

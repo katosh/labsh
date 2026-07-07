@@ -117,6 +117,11 @@ ssh -L 8888:localhost:8888 user@host
 | `labsh token [--rotate\|--path]` | Print, rotate, or locate the stable auth token at `.jupyter/token` |
 | `labsh password`         | Set a persistent password (optional, coexists with token) |
 
+The server env ships `pip`, so JupyterLab's in-UI **Extension Manager**
+works out of the box. To bake extra packages into the server build, set
+`LABSH_WITH` to a whitespace-separated list — each is appended as a
+`--with` (e.g. `LABSH_WITH="jupyterlab-code-formatter black isort" labsh start`).
+
 ### Kernelspec management
 
 | Command                 | What it does |

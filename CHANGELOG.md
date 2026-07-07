@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.6.0] - 2026-07-06
+## [0.5.0] - 2026-07-06
 
 ### Added — kernel resilience: stop guardrail + hot extension installs
 
@@ -47,7 +47,16 @@ even on SIGKILL — so the only safe restart is a deliberate one.
 - Hot extension install: package lands in the running server env, the
   live `/lab` page serves it without a restart, spec persists.
 
-## [0.5.0] - 2026-07-06
+### Added — pip in the server env + `LABSH_WITH` seam
+
+- The server env now ships `pip`, so JupyterLab's in-UI **Extension
+  Manager** (which shells out to pip) works out of the box instead of
+  being disabled in the uvx-built env.
+- New `LABSH_WITH` environment variable: a whitespace-separated list
+  of extra packages appended as `--with` to the server build — bake in
+  labextensions or their backends (e.g.
+  `LABSH_WITH="jupyterlab-code-formatter black isort" labsh start`)
+  without forking the baseline. Mirrors the `LABSH_AI` toggle.
 
 ### Added — native Jupyter Server interface (REST + kernel websocket)
 
