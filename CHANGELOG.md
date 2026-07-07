@@ -1,5 +1,133 @@
 # Changelog
 
+## [0.5.0] - 2026-07-06
+
+### Added — kernel resilience: stop guardrail + hot extension installs
+
+Motivated by a production incident where automated service restarts
+destroyed an operator's warm kernel state (hours of interactive work).
+Kernels cannot outlive the Jupyter server — jupyter-server shuts all
+kernels down on exit (`cleanup_kernels` → `shutdown_all`), and
+ipykernel's parent poller exits kernels within ~1s of the server dying
+even on SIGKILL — so the only safe restart is a deliberate one.
+
+- **`labsh stop` refuses while live kernels exist** (exit 3), listing
+  each kernel's execution state, connected websocket clients, last
+  activity, and owning notebook. `labsh stop --force` overrides. A
+  server that no longer answers its REST API has nothing left to
+  protect and is stopped without the check (automated recovery of a
+  wedged server keeps working). Supervisors should *not* pass
+  `--force` on automated bounce paths — the refusal is the signal
+  that a healthy server holds state worth keeping.
+- **`labsh ext install PKG...`** installs prebuilt JupyterLab
+  extensions into the **running** server's environment. JupyterLab
+  enumerates federated extensions at page-load time, so a browser
+  refresh activates them — no server restart, kernels keep running.
+  Installed specs persist in `.jupyter/labsh-extensions` and are
+  re-included (via `--with`) on every future `labsh start`. Packages
+  that also ship a jupyter *server* extension are detected and
+  flagged as needing one deliberate restart for their backend.
+- **`labsh ext list`** shows persisted specs and the labextensions
+  present in the running server env.
+
+### Fixed
+
+- `labsh stop` now actually removes the stale `labsh.bg.pid` (the
+  shell wrapper exec'd into the helper before reaching its cleanup
+  line, so the pidfile was never deleted).
+
+### Tests
+
+- Regression: a barrage of client operations (`ps`, `find`, `status`,
+  `inspect`, `exec` over native/ZMQ, notebook reads) leaves the server
+  pid unchanged and kernel state intact — client ops can never
+  signal/stop the server.
+- Stop guardrail: refusal with live kernels (exit 3, server survives,
+  state intact) and `--force` override.
+- Hot extension install: package lands in the running server env, the
+  live `/lab` page serves it without a restart, spec persists.
+
+### Added — pip in the server env + `LABSH_WITH` seam
+
+- The server env now ships `pip`, so JupyterLab's in-UI **Extension
+  Manager** (which shells out to pip) works out of the box instead of
+  being disabled in the uvx-built env.
+- New `LABSH_WITH` environment variable: a whitespace-separated list
+  of extra packages appended as `--with` to the server build — bake in
+  labextensions or their backends (e.g.
+  `LABSH_WITH="jupyterlab-code-formatter black isort" labsh start`)
+  without forking the baseline. Mirrors the `LABSH_AI` toggle.
+
+### Added — native Jupyter Server interface (REST + kernel websocket)
+
+Runtime kernel commands (`ps`, `find`, `exec`, `inspect`, `notebook
+attach/append/replace`) now interface with a running Jupyter server
+*natively* instead of reaching around it via connection files:
+
+- **Discovery**: `GET /api/sessions` supplies the server's own
+  notebook↔kernel mapping; `GET /api/kernels` covers sessionless
+  kernels. Servers are found from the project's
+  `.jupyter/share/jupyter/runtime/jpserver-*.json`, from **parent
+  directories'** `.jupyter` trees (a project nested under a
+  workspace-wide server root now finds that server), and from the
+  standard jupyter runtime dir — or targeted explicitly with
+  `--server URL` / `LABSH_SERVER` (token via `--token`, `LABSH_TOKEN`,
+  or `?token=` in the URL; verified via `GET /api/status`).
+- **Execution**: `kernel exec` / `inspect` / `notebook append
+  --execute` run through the kernel websocket
+  (`/api/kernels/<id>/channels`, Jupyter message protocol
+  `execute_request`), authenticated with the server token, over http
+  or https. Output shapes and exit codes are unchanged.
+- **Fallback**: kernels with no serving session keep working over the
+  classic connection-file/ZMQ path; `--local` forces it. `labsh stop`
+  deliberately stays project-scoped and never touches a parent
+  workspace server.
+
+### Added — `labsh kernel interrupt` / `labsh kernel restart`
+
+`POST /api/kernels/<id>/interrupt|restart` via the owning server;
+`interrupt` falls back to SIGINT for server-less local kernels.
+
+### Fixed — `kernel exec -n <name>` hung with empty output on a busy tree
+
+Notebook→kernel resolution (`_match_notebook`, behind `kernel
+exec`/`find`/`inspect` and the `notebook` subcommands) turned a
+basename query into candidate paths by walking the *entire* directory
+tree under `$PWD` (`PROJECT_DIR.rglob(<name>)`). Invoked from a high-up
+working directory over a large NFS tree — exactly how the root-server
+wrappers call labsh from inside a project — that walk took minutes, so
+`kernel exec -n <name>` appeared to **hang and return nothing**: the
+process was stuck globbing the filesystem during kernel *resolution*,
+before a single byte of code ever reached the kernel. `kernel ps` and
+`-k <id>` selectors were unaffected because they never glob, which is
+why discovery looked healthy while exec stalled.
+
+Resolution now matches the query against the notebook paths the kernels
+already carry (from `jupyter_session` / the server's `/api/sessions`),
+touching the filesystem at most for a single `stat`, never a recursive
+walk — the glob was redundant anyway, since a globbed path only ever
+matched a kernel whose absolute notebook path is already known here. The
+`$PWD`-scoping the walk used to provide is preserved as a tie-breaker
+when a basename matches kernels in several locations. Independent of the
+transport, so both the native websocket path and the ZMQ fallback are
+fixed.
+
+### Changed
+
+- The labsh helper venv now also carries `websocket-client` (pure
+  Python, zero transitive deps — the one new dependency backing the
+  websocket transport; `jupyter_client` offers no websocket client).
+- Every REST call to the server is now bounded by a timeout (default
+  30 s; 5 s for the stop guardrail's kernel probes; 120 s for
+  kernel-launching calls) — a half-dead server that accepts the TCP
+  connection but never answers can no longer hang labsh commands
+  forever.
+- The websocket→ZMQ execution fallback only triggers for failures
+  *before* the execute request is sent (connect, handshake, dead-kernel
+  preflight). A mid-flight failure after the code may have reached the
+  kernel now surfaces as an error instead of silently re-running the
+  cell over ZMQ — side-effecting code can no longer execute twice.
+
 ## [0.4.1] - 2026-05-07
 
 ### Fixed — kernels built against Lmod-managed Python die on startup

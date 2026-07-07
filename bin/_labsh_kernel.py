@@ -1,34 +1,44 @@
 #!/usr/bin/env python3
 """
 _labsh_kernel.py — backend for `labsh` subcommands that discover, attach to, and
-drive running Jupyter kernels without going through the REST API for code
-execution.
+drive running Jupyter kernels.
+
+Two transports:
+
+  * NATIVE (preferred): when a running Jupyter Server owns the kernel — i.e.
+    the kernel appears in the server's /api/sessions or /api/kernels — labsh
+    talks to the server directly: REST for discovery, session management,
+    interrupt/restart and notebook contents; the kernel websocket
+    (/api/kernels/<id>/channels, Jupyter message protocol) for execution and
+    inspection. Auth is the server's token; http and https both work.
+
+  * LOCAL (fallback): kernels with no serving session (bare `jupyter
+    console`, a kernel whose server died, ...) are driven the classic way —
+    psutil process scan for `-m ipykernel_launcher -f <connection-file>`,
+    then ZMQ via jupyter_client. `--local` forces this path.
 
 This file is invoked by bin/labsh. It is intentionally a single file with no
-non-stdlib dependencies beyond psutil, jupyter_client, and nbformat — all of
-which are ensured in ./.venv by bin/labsh before dispatching here.
+non-stdlib dependencies beyond psutil, jupyter_client, nbformat, and
+websocket-client — all of which are ensured in the labsh helper venv by
+bin/labsh before dispatching here.
 
-Discovery strategy (borrowed from settylab/jupyter_kernel_inspector):
-  * Kernels are scanned via psutil, matching cmdlines that contain
-    `-m ipykernel_launcher -f <connection-file>`. The connection file is read
-    directly from the path on the cmdline, so this works in any sandbox
-    regardless of JUPYTER_RUNTIME_DIR.
-  * Modern jupyter_server writes the absolute notebook path into the
-    connection file as `jupyter_session`, so we get notebook<->kernel mapping
-    for free.
-  * Running labsh servers are discovered by walking the runtime dir's
-    jpserver-<pid>.json files and verifying the pid is alive.
+Server discovery order (first hit wins for --server; otherwise merged):
+  1. Explicit --server URL (token via --token, $LABSH_TOKEN, or ?token= in
+     the URL). Verified live via GET /api/status.
+  2. jpserver-<pid>.json files in the project runtime dir
+     (./.jupyter/share/jupyter/runtime), pid-verified.
+  3. The same walk applied to parent directories' .jupyter trees — so a
+     project nested under a workspace-wide server root finds that server.
+  4. jupyter_core's default runtime dir (what `jupyter server list` reads).
 """
 
 from __future__ import annotations
 
 import argparse
 import getpass
-import glob
 import json
 import os
 import queue
-import re
 import signal
 import ssl
 import sys
@@ -36,7 +46,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +68,11 @@ JUPYTER_DATA_DIR = Path(
 )
 JUPYTER_RUNTIME_DIR = JUPYTER_DATA_DIR / "runtime"
 
+ENV_SERVER = "LABSH_SERVER"
+ENV_TOKEN = "LABSH_TOKEN"
+
+PROTOCOL_VERSION = "5.3"
+
 
 def eprint(*args: Any, **kwargs: Any) -> None:
     kwargs.setdefault("file", sys.stderr)
@@ -63,29 +80,40 @@ def eprint(*args: Any, **kwargs: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Kernel discovery
+# Kernel model
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class Kernel:
-    pid: int
+    pid: int | None
     username: str
-    connection_file: Path
+    connection_file: Path | None
     short_id: str
     kernelspec: str | None
-    notebook_path: Path | None  # absolute, as reported by jupyter_session
+    notebook_path: Path | None  # absolute when the owning root is known
     connection: dict[str, Any] = field(default_factory=dict)
+    server: "LabServer | None" = None  # owning Jupyter server, if any
+    kernel_id: str | None = None  # server-side kernel uuid
+
+    @property
+    def native(self) -> bool:
+        return self.server is not None and bool(self.kernel_id)
 
     def as_row(self) -> dict[str, str]:
         return {
-            "PID": str(self.pid),
+            "PID": str(self.pid) if self.pid else "-",
             "ID": self.short_id,
             "KERNEL": self.kernelspec or "-",
             "NOTEBOOK": (
                 str(self.notebook_path) if self.notebook_path else "<unknown>"
             ),
         }
+
+
+def _kernel_key(k: Kernel) -> tuple:
+    """Stable identity for dedup across match passes."""
+    return (k.pid, k.kernel_id, str(k.connection_file or ""))
 
 
 def _is_ipykernel(proc_info: dict[str, Any]) -> bool:
@@ -99,7 +127,7 @@ def _is_ipykernel(proc_info: dict[str, Any]) -> bool:
 
 
 def discover_kernels(current_user_only: bool = True) -> list[Kernel]:
-    """Scan processes for running ipykernel_launcher instances.
+    """Scan processes for running ipykernel_launcher instances (LOCAL path).
 
     We identify the connection file from the `-f` flag and read it directly.
     `jupyter_session` (added by jupyter_server) maps the kernel to its
@@ -165,60 +193,144 @@ def discover_kernels(current_user_only: bool = True) -> list[Kernel]:
 
 @dataclass
 class LabServer:
-    pid: int
+    pid: int | None
     url: str
     token: str
-    root_dir: Path
+    root_dir: Path | None  # None when unknown (explicit --server URL)
     secure: bool
     port: int
-    runtime_file: Path
+    runtime_file: Path | None
+    source: str = "project"  # project | parent | runtime | explicit
 
     @property
     def api_base(self) -> str:
         return self.url.rstrip("/")
 
 
-def discover_servers() -> list[LabServer]:
-    """Find running jupyter servers by walking the runtime dir.
+def _server_from_runtime_file(jf: Path, source: str) -> LabServer | None:
+    """Parse one jpserver-<pid>.json, returning a live LabServer or None.
 
-    Each running server writes a `jpserver-<pid>.json` file containing url,
-    token, and root_dir. We keep only those whose pid is still live in this
-    PID namespace (sandbox-safe: orphaned files from a previous run are
-    ignored).
+    Only files whose pid is alive in this PID namespace are considered
+    (sandbox-safe: orphaned files from a previous run are ignored).
     """
+    try:
+        data = json.loads(jf.read_text())
+    except (json.JSONDecodeError, PermissionError, FileNotFoundError, OSError):
+        return None
+    pid = data.get("pid")
+    if not isinstance(pid, int):
+        return None
+    if not psutil.pid_exists(pid):
+        return None
+    try:
+        proc = psutil.Process(pid)
+        cmdline = proc.cmdline()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return None
+    # Sanity: ensure this really is a jupyter process. This guards against
+    # PID reuse after the server died without cleaning up its json.
+    if not any("jupyter" in part for part in cmdline):
+        return None
+    root_raw = data.get("root_dir")
+    return LabServer(
+        pid=pid,
+        url=data.get("url", ""),
+        token=data.get("token") or "",
+        root_dir=Path(root_raw) if root_raw else PROJECT_DIR,
+        secure=bool(data.get("secure")),
+        port=int(data.get("port") or 0),
+        runtime_file=jf,
+        source=source,
+    )
+
+
+def _scan_runtime_dir(runtime_dir: Path, source: str) -> list[LabServer]:
     out: list[LabServer] = []
-    if not JUPYTER_RUNTIME_DIR.is_dir():
+    try:
+        if not runtime_dir.is_dir():
+            return out
+        files = sorted(runtime_dir.glob("jpserver-*.json"))
+    except OSError:
         return out
-    for jf in sorted(JUPYTER_RUNTIME_DIR.glob("jpserver-*.json")):
-        try:
-            data = json.loads(jf.read_text())
-        except (json.JSONDecodeError, PermissionError, FileNotFoundError):
-            continue
-        pid = data.get("pid")
-        if not isinstance(pid, int):
-            continue
-        if not psutil.pid_exists(pid):
-            continue
-        try:
-            proc = psutil.Process(pid)
-            cmdline = proc.cmdline()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-        # Sanity: ensure this really is a jupyter process. This guards against
-        # PID reuse after the server died without cleaning up its json.
-        if not any("jupyter" in part for part in cmdline):
-            continue
-        out.append(
-            LabServer(
-                pid=pid,
-                url=data.get("url", ""),
-                token=data.get("token") or "",
-                root_dir=Path(data.get("root_dir") or PROJECT_DIR),
-                secure=bool(data.get("secure")),
-                port=int(data.get("port") or 0),
-                runtime_file=jf,
+    for jf in files:
+        s = _server_from_runtime_file(jf, source)
+        if s is not None:
+            out.append(s)
+    return out
+
+
+def discover_servers() -> list[LabServer]:
+    """Project-scoped discovery: jpserver-*.json in THIS project's runtime
+    dir only. Used by `labsh stop`, which must never reach outside the
+    project (a parent workspace server is not ours to kill)."""
+    return _scan_runtime_dir(JUPYTER_RUNTIME_DIR, "project")
+
+
+def _explicit_server(url: str, token: str | None) -> LabServer:
+    """Build a LabServer from an explicit URL; verify it responds."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        _die(f"labsh: --server URL must be http(s)://..., got '{url}'")
+    if token is None:
+        qs = urllib.parse.parse_qs(parsed.query)
+        token = (qs.get("token") or [None])[0]
+    clean = urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path.rstrip("/") + "/", "", "")
+    )
+    server = LabServer(
+        pid=None,
+        url=clean,
+        token=token or "",
+        root_dir=None,
+        secure=parsed.scheme == "https",
+        port=parsed.port or (443 if parsed.scheme == "https" else 80),
+        runtime_file=None,
+        source="explicit",
+    )
+    # Fail fast with a clear message if unreachable or unauthorized.
+    ServerClient(server).request("GET", "api/status")
+    return server
+
+
+def discover_all_servers(
+    explicit: str | None = None, token: str | None = None
+) -> list[LabServer]:
+    """Discovery for the native path.
+
+    Explicit URL (flag or $LABSH_SERVER) short-circuits everything else.
+    Otherwise: project runtime dir, then each parent directory's
+    .jupyter/share/jupyter/runtime (a workspace-wide server whose root
+    contains this project), then jupyter_core's default runtime dir (the
+    same files `jupyter server list` reads). Deduped by URL.
+    """
+    explicit = explicit or os.environ.get(ENV_SERVER)
+    token = token or os.environ.get(ENV_TOKEN)
+    if explicit:
+        return [_explicit_server(explicit, token)]
+
+    out: list[LabServer] = []
+    seen_urls: set[str] = set()
+
+    def add(servers: list[LabServer]) -> None:
+        for s in servers:
+            key = s.api_base
+            if key and key not in seen_urls:
+                seen_urls.add(key)
+                out.append(s)
+
+    add(_scan_runtime_dir(JUPYTER_RUNTIME_DIR, "project"))
+    for parent in PROJECT_DIR.parents:
+        add(
+            _scan_runtime_dir(
+                parent / ".jupyter" / "share" / "jupyter" / "runtime", "parent"
             )
         )
+    try:
+        from jupyter_core.paths import jupyter_runtime_dir  # type: ignore
+
+        add(_scan_runtime_dir(Path(jupyter_runtime_dir()), "runtime"))
+    except Exception:
+        pass
     return out
 
 
@@ -229,6 +341,8 @@ def server_for_path(servers: list[LabServer], path: Path) -> LabServer | None:
     best: LabServer | None = None
     best_len = -1
     for s in servers:
+        if s.root_dir is None:
+            continue
         try:
             root = s.root_dir.resolve()
         except OSError:
@@ -244,12 +358,449 @@ def server_for_path(servers: list[LabServer], path: Path) -> LabServer | None:
 
 
 # ---------------------------------------------------------------------------
+# Native server client (REST + kernel websocket)
+# ---------------------------------------------------------------------------
+
+
+class ExecutionStartedError(RuntimeError):
+    """Websocket execution failed AFTER the execute_request was sent.
+
+    The code may be running (or may already have run) in the kernel, so
+    callers must surface the failure rather than retry over another
+    transport — an automatic ZMQ re-run would execute side-effecting code
+    twice."""
+
+
+class ServerClient:
+    """Client for a running Jupyter server's REST API and kernel websockets."""
+
+    def __init__(self, server: LabServer) -> None:
+        self.server = server
+        self._ssl_ctx = None
+        if server.url.startswith("https://"):
+            # Lab certs are often self-signed on HPC — trust them since we
+            # only ever talk to servers we discovered locally (or that the
+            # user pointed us at explicitly).
+            self._ssl_ctx = ssl._create_unverified_context()
+
+    # -- REST ---------------------------------------------------------------
+
+    def request(
+        self,
+        method: str,
+        api_path: str,
+        body: dict | None = None,
+        timeout: float = 30.0,
+    ) -> Any:
+        # Always bound the request: a half-dead server that accepts the TCP
+        # connection but never answers must surface as unreachable (the stop
+        # guardrail and discovery both rely on that), not hang forever.
+        url = f"{self.server.api_base}/{api_path}"
+        headers = {"Content-Type": "application/json"}
+        if self.server.token:
+            headers["Authorization"] = f"token {self.server.token}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=timeout) as r:
+                raw = r.read()
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(
+                f"labsh: server {method} /{api_path} failed: "
+                f"HTTP {e.code} {e.read().decode(errors='replace')}"
+            ) from e
+        except (urllib.error.URLError, OSError) as e:
+            # URLError for connect failures; bare socket timeouts and resets
+            # from read() arrive as raw OSError subclasses.
+            raise RuntimeError(
+                f"labsh: cannot reach jupyter server at {self.server.url}: {e}"
+            ) from e
+        return json.loads(raw) if raw else {}
+
+    def sessions(self, timeout: float = 30.0) -> list[dict]:
+        result = self.request("GET", "api/sessions", timeout=timeout)
+        return result if isinstance(result, list) else []
+
+    def kernels(self, timeout: float = 30.0) -> list[dict]:
+        result = self.request("GET", "api/kernels", timeout=timeout)
+        return result if isinstance(result, list) else []
+
+    def create_session(self, path: str, name: str, kernel_name: str) -> dict:
+        # Kernel launch can legitimately take a while (cold venv on NFS) —
+        # bound it generously rather than at the default REST timeout.
+        return self.request(
+            "POST",
+            "api/sessions",
+            {
+                "kernel": {"name": kernel_name},
+                "name": name,
+                "path": path,
+                "type": "notebook",
+            },
+            timeout=120.0,
+        )
+
+    def delete_session(self, session_id: str) -> None:
+        self.request("DELETE", f"api/sessions/{urllib.parse.quote(session_id)}")
+
+    def interrupt_kernel(self, kernel_id: str) -> None:
+        self.request(
+            "POST", f"api/kernels/{urllib.parse.quote(kernel_id)}/interrupt"
+        )
+
+    def restart_kernel(self, kernel_id: str) -> None:
+        # Waits on the replacement kernel coming up — same slow-launch
+        # allowance as create_session.
+        self.request(
+            "POST",
+            f"api/kernels/{urllib.parse.quote(kernel_id)}/restart",
+            timeout=120.0,
+        )
+
+    # -- kernel websocket -----------------------------------------------------
+
+    def _ws_connect(self, kernel_id: str, session: str):
+        import websocket  # type: ignore
+
+        base = self.server.api_base
+        ws_base = "ws" + base[len("http"):]  # http->ws, https->wss
+        url = (
+            f"{ws_base}/api/kernels/{urllib.parse.quote(kernel_id)}/channels"
+            f"?session_id={session}"
+        )
+        headers = []
+        if self.server.token:
+            headers.append(f"Authorization: token {self.server.token}")
+        sslopt = {"cert_reqs": ssl.CERT_NONE} if ws_base.startswith("wss") else None
+        try:
+            return websocket.create_connection(
+                url, header=headers, sslopt=sslopt, timeout=10
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"labsh: cannot open kernel websocket at {self.server.url}: {e}"
+            ) from e
+
+    @staticmethod
+    def _jupyter_msg(msg_type: str, content: dict, session: str, channel: str) -> dict:
+        return {
+            "header": {
+                "msg_id": uuid.uuid4().hex,
+                "username": "labsh",
+                "session": session,
+                "msg_type": msg_type,
+                "version": PROTOCOL_VERSION,
+                "date": datetime.now(timezone.utc).isoformat(),
+            },
+            "parent_header": {},
+            "metadata": {},
+            "content": content,
+            "channel": channel,
+            "buffers": [],
+        }
+
+    @staticmethod
+    def _recv_msg(ws) -> dict | None:
+        """One websocket frame -> parsed Jupyter message, or None to skip."""
+        import websocket  # type: ignore
+
+        try:
+            raw = ws.recv()
+        except websocket.WebSocketTimeoutException:
+            return None
+        except (websocket.WebSocketConnectionClosedException, OSError) as e:
+            raise RuntimeError(
+                f"labsh: kernel websocket closed unexpectedly: {e}"
+            ) from e
+        if isinstance(raw, bytes):  # binary subprotocol frame — not requested
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    def _await_reply(self, ws, msg_id: str, reply_type: str, timeout: float) -> dict:
+        """Wait for a shell reply to msg_id, ignoring everything else."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            msg = self._recv_msg(ws)
+            if msg is None:
+                continue
+            if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
+                continue
+            if msg.get("channel") == "shell" and msg.get("msg_type") == reply_type:
+                return msg
+        raise RuntimeError(
+            f"labsh: kernel did not answer {reply_type.replace('_reply', '')} "
+            f"within {timeout:.0f}s — it may be dead or busy"
+        )
+
+    def execute(
+        self,
+        kernel_id: str,
+        code: str,
+        *,
+        timeout: float | None,
+        capture: bool,
+        short_id: str = "",
+    ) -> tuple[int, str, str, list[dict], int | None]:
+        """Execute `code` through the server's kernel websocket.
+
+        Same contract as execute_in_kernel(): returns
+        (exit_code, captured_stdout, captured_stderr, outputs, execution_count).
+        """
+        session = uuid.uuid4().hex
+        ws = self._ws_connect(kernel_id, session)
+        try:
+            # Preflight: prove the kernel answers at all (parity with the
+            # ZMQ path's wait_for_ready) so timeout=None can't hang forever
+            # on a dead kernel.
+            info = self._jupyter_msg("kernel_info_request", {}, session, "shell")
+            ws.settimeout(2)
+            ws.send(json.dumps(info))
+            try:
+                self._await_reply(ws, info["header"]["msg_id"], "kernel_info_reply", 10)
+            except RuntimeError as e:
+                raise RuntimeError(
+                    f"labsh: kernel {short_id or kernel_id[:8]} is not responding: {e}"
+                ) from e
+
+            req = self._jupyter_msg(
+                "execute_request",
+                {
+                    "code": code,
+                    "silent": False,
+                    "store_history": False,
+                    "user_expressions": {},
+                    "allow_stdin": False,
+                    "stop_on_error": True,
+                },
+                session,
+                "shell",
+            )
+            msg_id = req["header"]["msg_id"]
+            per_msg_timeout = 5.0 if timeout is None else min(5.0, timeout)
+            deadline = None if timeout is None else time.monotonic() + timeout
+            ws.settimeout(per_msg_timeout)
+
+            # From the send onward the request may have reached the kernel,
+            # so any failure below must NOT be retried over another
+            # transport (side-effecting code would run twice) — mark it.
+            try:
+                ws.send(json.dumps(req))
+
+                collector = OutputCollector(capture)
+                reply_count: int | None = None
+                reply_seen = False
+                idle_grace: float | None = None  # reply straggler allowance
+
+                while not (collector.idle and reply_seen):
+                    now = time.monotonic()
+                    if deadline is not None and now > deadline:
+                        return (
+                            124,
+                            "".join(collector.stdout_parts),
+                            "".join(collector.stderr_parts),
+                            collector.outputs,
+                            collector.execution_count,
+                        )
+                    if collector.idle:
+                        if idle_grace is None:
+                            idle_grace = now + 5.0
+                        elif now > idle_grace:
+                            break
+                    msg = self._recv_msg(ws)
+                    if msg is None:
+                        continue
+                    if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
+                        continue
+                    channel = msg.get("channel")
+                    if channel == "iopub":
+                        collector.handle_iopub(
+                            msg.get("msg_type", ""), msg.get("content") or {}
+                        )
+                    elif channel == "shell" and msg.get("msg_type") == "execute_reply":
+                        reply_seen = True
+                        ec = (msg.get("content") or {}).get("execution_count")
+                        if ec is not None:
+                            reply_count = ec
+            except ExecutionStartedError:
+                raise
+            except Exception as e:
+                # Includes websocket-lib exceptions from send(); whatever the
+                # type, the only safe report past this point is "may have run".
+                raise ExecutionStartedError(
+                    f"{e} — the request had already been sent, so the code may "
+                    "have executed; NOT retrying over ZMQ"
+                ) from e
+
+            execution_count = (
+                collector.execution_count
+                if collector.execution_count is not None
+                else reply_count
+            )
+            return (
+                1 if collector.had_error else 0,
+                "".join(collector.stdout_parts),
+                "".join(collector.stderr_parts),
+                collector.outputs,
+                execution_count,
+            )
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+
+def discover_server_kernels(server: LabServer) -> list[Kernel]:
+    """Enumerate a server's kernels the server-native way: /api/sessions for
+    the notebook<->kernel mapping, /api/kernels for sessionless kernels."""
+    client = ServerClient(server)
+    username = getpass.getuser()
+    out: list[Kernel] = []
+    seen_ids: set[str] = set()
+
+    def abs_nb(rel: str | None) -> Path | None:
+        if not rel:
+            return None
+        if server.root_dir is not None:
+            return (server.root_dir / rel).resolve()
+        return Path(rel)  # root unknown (explicit URL): keep server-relative
+
+    for sess in client.sessions():
+        kinfo = sess.get("kernel") or {}
+        kid = kinfo.get("id")
+        if not kid:
+            continue
+        seen_ids.add(kid)
+        out.append(
+            Kernel(
+                pid=None,
+                username=username,
+                connection_file=None,
+                short_id=kid[:8],
+                kernelspec=kinfo.get("name"),
+                notebook_path=abs_nb(sess.get("path")),
+                server=server,
+                kernel_id=kid,
+            )
+        )
+    for kinfo in client.kernels():
+        kid = kinfo.get("id")
+        if not kid or kid in seen_ids:
+            continue
+        out.append(
+            Kernel(
+                pid=None,
+                username=username,
+                connection_file=None,
+                short_id=kid[:8],
+                kernelspec=kinfo.get("name"),
+                notebook_path=None,
+                server=server,
+                kernel_id=kid,
+            )
+        )
+    return out
+
+
+def merge_kernels(local: list[Kernel], served: list[Kernel]) -> list[Kernel]:
+    """Merge the process scan with server enumerations.
+
+    A served kernel and a local process are the same kernel when the
+    connection file is named kernel-<kernel_id>.json (jupyter_server's
+    convention), or — as a fallback — when both map to the same notebook.
+    Merged entries carry both identities: pid + connection file from the
+    process, server + kernel id (authoritative notebook mapping) from the
+    server, so execution prefers the native path.
+    """
+    by_uuid: dict[str, Kernel] = {}
+    for k in local:
+        if k.connection_file is None:
+            continue
+        stem = k.connection_file.stem
+        u = stem[len("kernel-"):] if stem.startswith("kernel-") else stem
+        by_uuid[u] = k
+
+    out: list[Kernel] = []
+    matched: set[int] = set()
+    for s in served:
+        lk = by_uuid.get(s.kernel_id or "")
+        if lk is None and s.notebook_path is not None:
+            for k in local:
+                if (
+                    id(k) not in matched
+                    and k.notebook_path is not None
+                    and k.notebook_path == s.notebook_path
+                ):
+                    lk = k
+                    break
+        if lk is not None:
+            matched.add(id(lk))
+            out.append(
+                Kernel(
+                    pid=lk.pid,
+                    username=lk.username or s.username,
+                    connection_file=lk.connection_file,
+                    short_id=s.short_id,
+                    kernelspec=s.kernelspec or lk.kernelspec,
+                    notebook_path=s.notebook_path or lk.notebook_path,
+                    connection=lk.connection,
+                    server=s.server,
+                    kernel_id=s.kernel_id,
+                )
+            )
+        else:
+            out.append(s)
+    for k in local:
+        if id(k) not in matched:
+            out.append(k)
+    return out
+
+
+def gather_kernels(args: argparse.Namespace | None = None) -> list[Kernel]:
+    """The kernel view every runtime subcommand works from.
+
+    --local        -> process scan only (classic path).
+    --server URL   -> that server's kernels only, all native.
+    default        -> all discoverable servers' kernels merged with the
+                      process scan; server-owned kernels prefer the native
+                      transport, the rest stay on ZMQ.
+    """
+    local_only = bool(getattr(args, "local", False)) if args is not None else False
+    server_url = getattr(args, "server", None) if args is not None else None
+    token = getattr(args, "token", None) if args is not None else None
+    if local_only and server_url:
+        _die("labsh: pass either --server or --local, not both")
+    if local_only:
+        return discover_kernels()
+
+    explicit = server_url or os.environ.get(ENV_SERVER)
+    try:
+        servers = discover_all_servers(server_url, token)
+    except RuntimeError as e:
+        _die(str(e))
+    served: list[Kernel] = []
+    for s in servers:
+        try:
+            served.extend(discover_server_kernels(s))
+        except RuntimeError as e:
+            if explicit:
+                _die(str(e))
+            eprint(f"labsh: warning: skipping server {s.url}: {e}")
+    if explicit:
+        return served
+    return merge_kernels(discover_kernels(), served)
+
+
+# ---------------------------------------------------------------------------
 # Contents API client
 # ---------------------------------------------------------------------------
 
 
 class ContentsClient:
-    """Minimal client for a running labsh server's /api/contents endpoint.
+    """Minimal client for a running server's /api/contents endpoint.
 
     We use this for notebook reads/writes so the server broadcasts file-change
     events to any open frontend (avoiding the "file has been modified on
@@ -257,47 +808,20 @@ class ContentsClient:
     """
 
     def __init__(self, server: LabServer) -> None:
-        self.server = server
-        self._ssl_ctx = None
-        if server.secure and server.url.startswith("https://"):
-            # Lab certs are often self-signed on HPC — trust them since we
-            # only ever talk to 127.0.0.1/localhost anyway.
-            self._ssl_ctx = ssl._create_unverified_context()
+        self._client = ServerClient(server)
 
-    def _request(
-        self,
-        method: str,
-        rel_path: str,
-        body: dict | None = None,
-    ) -> dict:
-        url = (
-            f"{self.server.api_base}/api/contents/"
-            f"{urllib.parse.quote(rel_path)}"
+    def _request(self, method: str, rel_path: str, body: dict | None = None) -> dict:
+        return self._client.request(
+            method, f"api/contents/{urllib.parse.quote(rel_path)}", body
         )
-        headers = {"Content-Type": "application/json"}
-        if self.server.token:
-            headers["Authorization"] = f"token {self.server.token}"
-        data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method, headers=headers)
-        try:
-            with urllib.request.urlopen(req, context=self._ssl_ctx) as r:
-                raw = r.read()
-        except urllib.error.HTTPError as e:
-            raise RuntimeError(
-                f"labsh: server {method} {rel_path} failed: "
-                f"HTTP {e.code} {e.read().decode(errors='replace')}"
-            ) from e
-        except urllib.error.URLError as e:
-            raise RuntimeError(
-                f"labsh: cannot reach labsh server at {self.server.url}: {e}"
-            ) from e
-        return json.loads(raw) if raw else {}
 
     def get_notebook(self, rel_path: str) -> dict:
         doc = self._request("GET", rel_path)
         content = doc.get("content")
         if not isinstance(content, dict):
-            raise RuntimeError(f"labsh: {rel_path}: not a notebook (type={doc.get('type')})")
+            raise RuntimeError(
+                f"labsh: {rel_path}: not a notebook (type={doc.get('type')})"
+            )
         return content
 
     def put_notebook(self, rel_path: str, notebook: dict) -> dict:
@@ -308,13 +832,18 @@ class ContentsClient:
 def notebook_rel_path(nb_abs: Path, server: LabServer) -> str:
     """Return the notebook path relative to the server's root_dir (as the
     Contents API expects)."""
+    if server.root_dir is None:
+        raise RuntimeError(
+            f"labsh: server {server.url} has an unknown root dir — pass the "
+            f"notebook path relative to the server root instead"
+        )
     nb_abs = nb_abs.resolve()
     root = server.root_dir.resolve()
     try:
         return str(nb_abs.relative_to(root))
     except ValueError as e:
         raise RuntimeError(
-            f"labsh: notebook {nb_abs} is not under labsh server root {root}"
+            f"labsh: notebook {nb_abs} is not under server root {root}"
         ) from e
 
 
@@ -329,70 +858,133 @@ def _match_notebook(kernels: list[Kernel], query: str) -> list[Kernel]:
     Accepted forms:
       * absolute path                         (must match an existing kernel exactly)
       * path relative to $PWD                 (absolute-matched)
-      * basename (globbed under $PWD)
-      * substring match against jupyter_session
+      * basename                              (matched against known kernels)
+      * substring match against the kernel's notebook path
+
+    Matching is done against the notebook paths the kernels *already* carry
+    (from jupyter_session / the server's /api/sessions) — never by walking the
+    filesystem. An earlier implementation globbed ``PROJECT_DIR.rglob(name)``
+    to turn a basename into candidate paths; from a high-up cwd (e.g. a
+    workspace root, which is exactly how the root-server wrappers invoke
+    labsh) that recursive walk of a large NFS tree took minutes and made
+    ``kernel exec -n <name>`` appear to hang with empty output. It was also
+    redundant: a globbed path only ever matched a kernel whose notebook path
+    is known here anyway, so we compare against those paths directly.
     """
     if not kernels:
         return []
 
     query_path = Path(query)
-    candidates: list[Path] = []
+
+    # Resolve the query to an absolute path *without* walking the tree:
+    #   - absolute query          -> as given
+    #   - $PWD-relative that exists -> resolved (a single stat, not a walk)
+    # Used only for exact comparison against kernels' known notebook paths.
+    abs_query: Path | None = None
     if query_path.is_absolute():
-        candidates.append(query_path.resolve())
+        abs_query = query_path.resolve()
     else:
         rel = (PROJECT_DIR / query_path).resolve()
         if rel.exists():
-            candidates.append(rel)
-        # glob on basename under project dir
-        for hit in PROJECT_DIR.rglob(query_path.name):
-            candidates.append(hit.resolve())
-
-    def by_abs(abs_path: Path) -> list[Kernel]:
-        return [
-            k
-            for k in kernels
-            if k.notebook_path is not None and k.notebook_path == abs_path
-        ]
+            abs_query = rel
 
     matches: list[Kernel] = []
-    seen_pids: set[int] = set()
-    for c in candidates:
-        for k in by_abs(c):
-            if k.pid not in seen_pids:
-                matches.append(k)
-                seen_pids.add(k.pid)
+    seen: set[tuple] = set()
+
+    def add(k: Kernel) -> None:
+        if _kernel_key(k) not in seen:
+            matches.append(k)
+            seen.add(_kernel_key(k))
+
+    # 1. Exact absolute match against known kernel notebook paths.
+    if abs_query is not None:
+        for k in kernels:
+            if k.notebook_path is not None and k.notebook_path == abs_query:
+                add(k)
+        if matches:
+            return matches
+
+    # 2. Basename match against known kernel notebook paths (no fs walk). If a
+    #    basename matches kernels in several locations, prefer those under the
+    #    current project dir — parity with the old glob-under-$PWD scoping —
+    #    before surfacing the ambiguity to the caller.
+    qname = query_path.name
+    basename_hits = [
+        k
+        for k in kernels
+        if k.notebook_path is not None and k.notebook_path.name == qname
+    ]
+    if len(basename_hits) > 1:
+        def _under_project(p: Path) -> bool:
+            try:
+                p.relative_to(PROJECT_DIR)
+            except ValueError:
+                return False
+            return True
+
+        scoped = [
+            k
+            for k in basename_hits
+            if k.notebook_path is not None and _under_project(k.notebook_path)
+        ]
+        if scoped:
+            basename_hits = scoped
+    for k in basename_hits:
+        add(k)
     if matches:
         return matches
 
-    # Substring fallback against jupyter_session
+    # 3. Substring fallback against the notebook path.
     q_lower = query.lower()
+    # Pure path computation (resolve() needs no filesystem), used only to let a
+    # $PWD-relative query match a served path given relative to an unknown
+    # server root (explicit --server URL).
+    q_abs_lower = str(
+        (query_path if query_path.is_absolute() else PROJECT_DIR / query_path).resolve()
+    ).lower()
     for k in kernels:
-        if (
-            k.notebook_path is not None
-            and q_lower in str(k.notebook_path).lower()
-            and k.pid not in seen_pids
-        ):
-            matches.append(k)
-            seen_pids.add(k.pid)
+        if k.notebook_path is None or _kernel_key(k) in seen:
+            continue
+        nb_lower = str(k.notebook_path).lower()
+        hit = q_lower in nb_lower
+        if not hit and not k.notebook_path.is_absolute():
+            # Served path relative to an unknown server root (explicit
+            # --server URL): match when the query ends in that path.
+            hit = (
+                q_lower == nb_lower
+                or q_lower.endswith("/" + nb_lower)
+                or q_abs_lower.endswith("/" + nb_lower)
+            )
+        if hit:
+            add(k)
     return matches
 
 
 def _match_kernel(kernels: list[Kernel], query: str) -> list[Kernel]:
-    """Resolve a kernel selector: PID, short id, or connection file path."""
+    """Resolve a kernel selector: PID, (short) kernel id, or connection file
+    path."""
     if query.isdigit():
         pid = int(query)
         return [k for k in kernels if k.pid == pid]
     query_path = Path(query)
     if query_path.is_absolute():
         qp = query_path.resolve()
-        return [k for k in kernels if k.connection_file.resolve() == qp]
-    # short id (prefix match on hex)
+        return [
+            k
+            for k in kernels
+            if k.connection_file is not None and k.connection_file.resolve() == qp
+        ]
+    # short id (prefix match on hex) or server kernel uuid prefix
     q_lower = query.lower()
     return [
         k
         for k in kernels
         if k.short_id.lower().startswith(q_lower)
-        or k.connection_file.stem.lower().endswith(q_lower)
+        or (k.kernel_id or "").lower().startswith(q_lower)
+        or (
+            k.connection_file is not None
+            and k.connection_file.stem.lower().endswith(q_lower)
+        )
     ]
 
 
@@ -445,6 +1037,89 @@ def resolve_one(
 # ---------------------------------------------------------------------------
 
 
+class OutputCollector:
+    """Accumulate iopub messages into labsh's output shape.
+
+    Shared by the ZMQ and websocket transports so both produce identical
+    stdout/stderr streams and nbformat-shaped output dicts.
+    """
+
+    def __init__(self, capture: bool) -> None:
+        self.capture = capture
+        self.had_error = False
+        self.idle = False
+        self.execution_count: int | None = None
+        self.stdout_parts: list[str] = []
+        self.stderr_parts: list[str] = []
+        self.outputs: list[dict] = []
+
+    def _emit_out(self, text: str) -> None:
+        if self.capture:
+            self.stdout_parts.append(text)
+        else:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+
+    def _emit_err(self, text: str) -> None:
+        if self.capture:
+            self.stderr_parts.append(text)
+        else:
+            sys.stderr.write(text)
+            sys.stderr.flush()
+
+    def handle_iopub(self, msg_type: str, content: dict) -> None:
+        if msg_type == "stream":
+            text = content.get("text", "")
+            if content.get("name") == "stdout":
+                self._emit_out(text)
+                self.outputs.append(
+                    {"output_type": "stream", "name": "stdout", "text": text}
+                )
+            else:
+                self._emit_err(text)
+                self.outputs.append(
+                    {"output_type": "stream", "name": "stderr", "text": text}
+                )
+        elif msg_type in ("execute_result", "display_data"):
+            data = content.get("data") or {}
+            text = data.get("text/plain", "")
+            if text:
+                self._emit_out(text + "\n")
+            metadata = content.get("metadata") or {}
+            if msg_type == "execute_result":
+                self.execution_count = content.get("execution_count")
+                self.outputs.append(
+                    {
+                        "output_type": "execute_result",
+                        "execution_count": self.execution_count,
+                        "data": data,
+                        "metadata": metadata,
+                    }
+                )
+            else:
+                self.outputs.append(
+                    {
+                        "output_type": "display_data",
+                        "data": data,
+                        "metadata": metadata,
+                    }
+                )
+        elif msg_type == "error":
+            self.had_error = True
+            tb = "\n".join(content.get("traceback", []))
+            self._emit_err(tb + "\n")
+            self.outputs.append(
+                {
+                    "output_type": "error",
+                    "ename": content.get("ename", ""),
+                    "evalue": content.get("evalue", ""),
+                    "traceback": content.get("traceback", []),
+                }
+            )
+        elif msg_type == "status" and content.get("execution_state") == "idle":
+            self.idle = True
+
+
 def execute_in_kernel(
     kernel: Kernel,
     code: str,
@@ -452,7 +1127,7 @@ def execute_in_kernel(
     timeout: float | None,
     capture: bool,
 ) -> tuple[int, str, str, list[dict], int | None]:
-    """Execute `code` in the given kernel.
+    """Execute `code` in the given kernel over ZMQ (connection-file path).
 
     If `capture` is False, stdout/stderr/result/display all stream directly to
     the parent process's stdout/stderr. If True, everything is accumulated
@@ -475,93 +1150,28 @@ def execute_in_kernel(
             ) from e
 
         msg_id = kc.execute(code, store_history=False, allow_stdin=False)
-        had_error = False
-        stdout_parts: list[str] = []
-        stderr_parts: list[str] = []
-        outputs: list[dict] = []
-        execution_count: int | None = None
+        collector = OutputCollector(capture)
         per_msg_timeout = 5.0 if timeout is None else min(5.0, timeout)
         deadline = None if timeout is None else time.monotonic() + timeout
 
-        while True:
+        while not collector.idle:
             if deadline is not None and time.monotonic() > deadline:
-                return 124, "".join(stdout_parts), "".join(stderr_parts), outputs, execution_count
+                return (
+                    124,
+                    "".join(collector.stdout_parts),
+                    "".join(collector.stderr_parts),
+                    collector.outputs,
+                    collector.execution_count,
+                )
             try:
                 msg = kc.get_iopub_msg(timeout=per_msg_timeout)
             except queue.Empty:
                 continue
             if msg["parent_header"].get("msg_id") != msg_id:
                 continue
-            msg_type = msg["msg_type"]
-            content = msg["content"]
+            collector.handle_iopub(msg["msg_type"], msg["content"])
 
-            if msg_type == "stream":
-                text = content.get("text", "")
-                if content["name"] == "stdout":
-                    if capture:
-                        stdout_parts.append(text)
-                    else:
-                        sys.stdout.write(text)
-                        sys.stdout.flush()
-                    outputs.append(
-                        {"output_type": "stream", "name": "stdout", "text": text}
-                    )
-                else:
-                    if capture:
-                        stderr_parts.append(text)
-                    else:
-                        sys.stderr.write(text)
-                        sys.stderr.flush()
-                    outputs.append(
-                        {"output_type": "stream", "name": "stderr", "text": text}
-                    )
-            elif msg_type in ("execute_result", "display_data"):
-                data = content.get("data") or {}
-                text = data.get("text/plain", "")
-                if text:
-                    if capture:
-                        stdout_parts.append(text + "\n")
-                    else:
-                        sys.stdout.write(text + "\n")
-                        sys.stdout.flush()
-                metadata = content.get("metadata") or {}
-                if msg_type == "execute_result":
-                    execution_count = content.get("execution_count")
-                    outputs.append(
-                        {
-                            "output_type": "execute_result",
-                            "execution_count": execution_count,
-                            "data": data,
-                            "metadata": metadata,
-                        }
-                    )
-                else:
-                    outputs.append(
-                        {
-                            "output_type": "display_data",
-                            "data": data,
-                            "metadata": metadata,
-                        }
-                    )
-            elif msg_type == "error":
-                had_error = True
-                tb = "\n".join(content.get("traceback", []))
-                if capture:
-                    stderr_parts.append(tb + "\n")
-                else:
-                    sys.stderr.write(tb + "\n")
-                    sys.stderr.flush()
-                outputs.append(
-                    {
-                        "output_type": "error",
-                        "ename": content.get("ename", ""),
-                        "evalue": content.get("evalue", ""),
-                        "traceback": content.get("traceback", []),
-                    }
-                )
-            elif msg_type == "status" and content.get("execution_state") == "idle":
-                break
-
+        execution_count = collector.execution_count
         # Drain the shell reply for the execution_count in the no-result case.
         try:
             reply = kc.get_shell_msg(timeout=5)
@@ -571,14 +1181,54 @@ def execute_in_kernel(
             pass
 
         return (
-            1 if had_error else 0,
-            "".join(stdout_parts),
-            "".join(stderr_parts),
-            outputs,
+            1 if collector.had_error else 0,
+            "".join(collector.stdout_parts),
+            "".join(collector.stderr_parts),
+            collector.outputs,
             execution_count,
         )
     finally:
         kc.stop_channels()
+
+
+def execute(
+    kernel: Kernel,
+    code: str,
+    *,
+    timeout: float | None,
+    capture: bool,
+) -> tuple[int, str, str, list[dict], int | None]:
+    """Transport dispatch: native websocket when a server owns the kernel,
+    ZMQ via the connection file otherwise."""
+    if kernel.native:
+        try:
+            return ServerClient(kernel.server).execute(
+                kernel.kernel_id,  # type: ignore[arg-type]
+                code,
+                timeout=timeout,
+                capture=capture,
+                short_id=kernel.short_id,
+            )
+        except ExecutionStartedError:
+            # The execute_request already reached (or may have reached) the
+            # kernel — re-running over ZMQ would execute side-effecting code
+            # twice. Surface the failure instead.
+            raise
+        except RuntimeError as e:
+            # Pre-send failures only (websocket connect/handshake, dead-kernel
+            # preflight): nothing has executed, so a merged kernel that still
+            # has a connection file can safely retry over ZMQ.
+            if kernel.connection_file is None:
+                raise
+            eprint(f"{e}")
+            eprint("labsh: falling back to direct connection-file (ZMQ) path")
+            return execute_in_kernel(kernel, code, timeout=timeout, capture=capture)
+    if kernel.connection_file is None:
+        _die(
+            f"labsh: kernel {kernel.short_id} has neither a reachable server "
+            f"nor a connection file"
+        )
+    return execute_in_kernel(kernel, code, timeout=timeout, capture=capture)
 
 
 # ---------------------------------------------------------------------------
@@ -630,13 +1280,26 @@ def _kernel_arg(args: argparse.Namespace) -> str | None:
     return getattr(args, "kernel", None)
 
 
+def _servers_for(args: argparse.Namespace | None) -> list[LabServer]:
+    """Discover servers honoring --server/--token/env for a command."""
+    server_url = getattr(args, "server", None) if args is not None else None
+    token = getattr(args, "token", None) if args is not None else None
+    try:
+        return discover_all_servers(server_url, token)
+    except RuntimeError as e:
+        _die(str(e))
+
+
 # ---------------------------------------------------------------------------
 # Subcommand implementations
 # ---------------------------------------------------------------------------
 
 
 def cmd_kernel_ps(args: argparse.Namespace) -> int:
-    kernels = discover_kernels(current_user_only=not args.all_users)
+    if getattr(args, "all_users", False):
+        kernels = discover_kernels(current_user_only=False)
+    else:
+        kernels = gather_kernels(args)
     if not kernels:
         eprint("labsh: no running kernels")
         return 0
@@ -645,7 +1308,7 @@ def cmd_kernel_ps(args: argparse.Namespace) -> int:
 
 
 def cmd_kernel_find(args: argparse.Namespace) -> int:
-    kernels = discover_kernels()
+    kernels = gather_kernels(args)
     matches = _match_notebook(kernels, args.query)
     if not matches:
         eprint(f"labsh: no running kernel matches '{args.query}'")
@@ -655,7 +1318,7 @@ def cmd_kernel_find(args: argparse.Namespace) -> int:
 
 
 def cmd_kernel_exec(args: argparse.Namespace) -> int:
-    kernels = discover_kernels()
+    kernels = gather_kernels(args)
     kernel = resolve_one(
         kernels,
         notebook=_notebook_arg(args),
@@ -663,14 +1326,15 @@ def cmd_kernel_exec(args: argparse.Namespace) -> int:
         required_action="kernel exec",
     )
     code = _read_code(args)
-    exit_code, *_ = execute_in_kernel(
-        kernel, code, timeout=args.timeout, capture=False
-    )
+    try:
+        exit_code, *_ = execute(kernel, code, timeout=args.timeout, capture=False)
+    except RuntimeError as e:
+        _die(str(e))
     return exit_code
 
 
 def cmd_kernel_inspect(args: argparse.Namespace) -> int:
-    kernels = discover_kernels()
+    kernels = gather_kernels(args)
     kernel = resolve_one(
         kernels,
         notebook=_notebook_arg(args),
@@ -705,15 +1369,64 @@ def cmd_kernel_inspect(args: argparse.Namespace) -> int:
         "        sys.stdout.write('  '.join(r[i].ljust(w[i]) for i in range(4)) + '\\n')\n"
         f"__lab_inspect({pattern!r})\n"
     )
-    exit_code, *_ = execute_in_kernel(kernel, code, timeout=args.timeout, capture=False)
+    try:
+        exit_code, *_ = execute(kernel, code, timeout=args.timeout, capture=False)
+    except RuntimeError as e:
+        _die(str(e))
     return exit_code
 
 
-def _resolve_notebook_path(arg: str | None) -> Path:
+def cmd_kernel_interrupt(args: argparse.Namespace) -> int:
+    kernels = gather_kernels(args)
+    kernel = resolve_one(
+        kernels,
+        notebook=_notebook_arg(args),
+        kernel_sel=_kernel_arg(args),
+        required_action="kernel interrupt",
+    )
+    if kernel.native:
+        try:
+            ServerClient(kernel.server).interrupt_kernel(kernel.kernel_id)  # type: ignore[arg-type]
+        except RuntimeError as e:
+            _die(str(e))
+        eprint(f"labsh: interrupted kernel {kernel.short_id} (via server)")
+        return 0
+    if kernel.pid:
+        try:
+            os.kill(kernel.pid, signal.SIGINT)
+        except (ProcessLookupError, PermissionError) as e:
+            _die(f"kernel interrupt: cannot signal pid {kernel.pid}: {e}")
+        eprint(f"labsh: interrupted kernel {kernel.short_id} (SIGINT to {kernel.pid})")
+        return 0
+    _die(f"kernel interrupt: no way to reach kernel {kernel.short_id}")
+
+
+def cmd_kernel_restart(args: argparse.Namespace) -> int:
+    kernels = gather_kernels(args)
+    kernel = resolve_one(
+        kernels,
+        notebook=_notebook_arg(args),
+        kernel_sel=_kernel_arg(args),
+        required_action="kernel restart",
+    )
+    if not kernel.native:
+        _die(
+            "kernel restart: only server-managed kernels can be restarted "
+            "(no running jupyter server owns this kernel)"
+        )
+    try:
+        ServerClient(kernel.server).restart_kernel(kernel.kernel_id)  # type: ignore[arg-type]
+    except RuntimeError as e:
+        _die(str(e))
+    eprint(f"labsh: restarted kernel {kernel.short_id} — state is cleared")
+    return 0
+
+
+def _resolve_notebook_path(arg: str | None, args: argparse.Namespace | None = None) -> Path:
     """Resolve the argument to an absolute notebook path.
 
     Resolution order when arg is given:
-      1. Running kernels' jupyter_session paths (exact, basename, substring)
+      1. Running kernels' notebook paths (exact, basename, substring)
       2. Server root-relative path
       3. CWD-relative path
       4. Absolute path (if given as such)
@@ -722,7 +1435,7 @@ def _resolve_notebook_path(arg: str | None) -> Path:
     """
     if arg:
         # 1. Check running kernels first — they know where their notebooks are
-        kernels = discover_kernels()
+        kernels = gather_kernels(args)
         matches = _match_notebook(kernels, arg)
         if len(matches) == 1 and matches[0].notebook_path is not None:
             return matches[0].notebook_path
@@ -733,9 +1446,11 @@ def _resolve_notebook_path(arg: str | None) -> Path:
             pass
 
         # 2. Server root-relative
-        servers = discover_servers()
+        servers = _servers_for(args)
         if servers:
             for s in servers:
+                if s.root_dir is None:
+                    continue
                 candidate = (s.root_dir / arg).resolve()
                 if candidate.exists():
                     return candidate
@@ -748,8 +1463,21 @@ def _resolve_notebook_path(arg: str | None) -> Path:
         if cwd_rel.exists():
             return cwd_rel
 
-        # 4. Glob basename under server root or CWD
-        search_dirs = [s.root_dir for s in servers] if servers else [PROJECT_DIR]
+        # 4. Glob basename under project-local server roots or CWD. Only
+        # roots at/under PROJECT_DIR are globbed — a recursive walk of a
+        # workspace-wide parent root would be pathologically slow on NFS.
+        def under_project(d: Path) -> bool:
+            try:
+                d.resolve().relative_to(PROJECT_DIR)
+            except (ValueError, OSError):
+                return False
+            return True
+
+        search_dirs = [
+            s.root_dir
+            for s in servers
+            if s.root_dir is not None and under_project(s.root_dir)
+        ] or [PROJECT_DIR]
         for d in search_dirs:
             hits = list(d.rglob(p.name))
             if len(hits) == 1:
@@ -759,7 +1487,7 @@ def _resolve_notebook_path(arg: str | None) -> Path:
         # (caller will get a clear "file not found" from nbformat/server)
         return cwd_rel
 
-    kernels = discover_kernels()
+    kernels = gather_kernels(args)
     nb_kernels = [k for k in kernels if k.notebook_path is not None]
     if len(nb_kernels) == 1:
         return nb_kernels[0].notebook_path  # type: ignore[return-value]
@@ -792,15 +1520,18 @@ def _new_notebook() -> dict:
 
 
 def _load_notebook(
-    nb_path: Path, *, allow_create: bool = False
+    nb_path: Path,
+    *,
+    allow_create: bool = False,
+    args: argparse.Namespace | None = None,
 ) -> tuple[dict, LabServer | None, str]:
-    """Load the notebook via a running labsh server if possible, else from disk.
-    Returns (notebook dict, server or None, path-key for saving).
+    """Load the notebook via a running jupyter server if possible, else from
+    disk. Returns (notebook dict, server or None, path-key for saving).
 
     If allow_create is True and the notebook doesn't exist, returns a fresh
     empty notebook instead of raising an error."""
     nb_path = nb_path.resolve()
-    server = server_for_path(discover_servers(), nb_path)
+    server = server_for_path(_servers_for(args), nb_path)
     if server is not None:
         rel = notebook_rel_path(nb_path, server)
         client = ContentsClient(server)
@@ -843,8 +1574,8 @@ def _cell_snippet(cell: dict) -> str:
 
 
 def cmd_notebook_cells(args: argparse.Namespace) -> int:
-    nb_path = _resolve_notebook_path(args.notebook)
-    nb, _server, _key = _load_notebook(nb_path)
+    nb_path = _resolve_notebook_path(args.notebook, args)
+    nb, _server, _key = _load_notebook(nb_path, args=args)
     cells = nb.get("cells", [])
     rows = [
         {
@@ -863,8 +1594,8 @@ def cmd_notebook_cells(args: argparse.Namespace) -> int:
 
 
 def cmd_notebook_show(args: argparse.Namespace) -> int:
-    nb_path = _resolve_notebook_path(args.notebook)
-    nb, _server, _key = _load_notebook(nb_path)
+    nb_path = _resolve_notebook_path(args.notebook, args)
+    nb, _server, _key = _load_notebook(nb_path, args=args)
     cells = nb.get("cells", [])
     if args.index < 0 or args.index >= len(cells):
         _die(f"notebook show: index {args.index} out of range (0..{len(cells) - 1})")
@@ -922,8 +1653,8 @@ def _make_md_cell(source: str) -> dict:
 
 
 def cmd_notebook_append(args: argparse.Namespace) -> int:
-    nb_path = _resolve_notebook_path(args.notebook)
-    nb, server, key = _load_notebook(nb_path, allow_create=True)
+    nb_path = _resolve_notebook_path(args.notebook, args)
+    nb, server, key = _load_notebook(nb_path, allow_create=True, args=args)
     cells = nb.setdefault("cells", [])
     content = _read_code(args)
 
@@ -939,16 +1670,19 @@ def cmd_notebook_append(args: argparse.Namespace) -> int:
     outputs: list[dict] = []
     execution_count: int | None = None
     if args.execute:
-        kernels = discover_kernels()
+        kernels = gather_kernels(args)
         kernel = resolve_one(
             kernels,
             notebook=str(nb_path),
             kernel_sel=None,
             required_action="notebook append --execute",
         )
-        exit_code, _stdout, _stderr, outputs, execution_count = execute_in_kernel(
-            kernel, content, timeout=args.timeout, capture=True
-        )
+        try:
+            exit_code, _stdout, _stderr, outputs, execution_count = execute(
+                kernel, content, timeout=args.timeout, capture=True
+            )
+        except RuntimeError as e:
+            _die(str(e))
     cells.append(
         _make_code_cell(content, outputs=outputs, execution_count=execution_count)
     )
@@ -961,8 +1695,8 @@ def cmd_notebook_append(args: argparse.Namespace) -> int:
 
 
 def cmd_notebook_replace(args: argparse.Namespace) -> int:
-    nb_path = _resolve_notebook_path(args.notebook)
-    nb, server, key = _load_notebook(nb_path)
+    nb_path = _resolve_notebook_path(args.notebook, args)
+    nb, server, key = _load_notebook(nb_path, args=args)
     cells = nb.setdefault("cells", [])
     if args.index < 0 or args.index >= len(cells):
         _die(f"notebook replace: index {args.index} out of range (0..{len(cells) - 1})")
@@ -975,16 +1709,19 @@ def cmd_notebook_replace(args: argparse.Namespace) -> int:
     if args.execute:
         if ct != "code":
             _die("notebook replace: --execute only applies to code cells")
-        kernels = discover_kernels()
+        kernels = gather_kernels(args)
         kernel = resolve_one(
             kernels,
             notebook=str(nb_path),
             kernel_sel=None,
             required_action="notebook replace --execute",
         )
-        exit_code, _stdout, _stderr, outputs, execution_count = execute_in_kernel(
-            kernel, content, timeout=args.timeout, capture=True
-        )
+        try:
+            exit_code, _stdout, _stderr, outputs, execution_count = execute(
+                kernel, content, timeout=args.timeout, capture=True
+            )
+        except RuntimeError as e:
+            _die(str(e))
     if ct == "code":
         cells[args.index] = _make_code_cell(
             content,
@@ -1003,70 +1740,91 @@ def cmd_notebook_replace(args: argparse.Namespace) -> int:
 
 def cmd_notebook_attach(args: argparse.Namespace) -> int:
     """Ensure a kernel exists for the given notebook path by asking a running
-    labsh server to create a Session for it. Prints the resulting kernel row."""
-    nb_path = _resolve_notebook_path(args.notebook)
-    servers = discover_servers()
-    server = server_for_path(servers, nb_path)
-    if server is None:
-        _die(
-            "notebook attach: no running labsh server owns this notebook. "
-            "Start one with `labsh` (foreground) or `labsh start` (background)."
-        )
-    rel = notebook_rel_path(nb_path, server)
-    # Check if a live kernel already exists.
-    kernels = discover_kernels()
-    existing = [k for k in kernels if k.notebook_path == nb_path]
+    jupyter server to create a Session for it. Prints the resulting kernel
+    row."""
+    servers = _servers_for(args)
+    explicit = getattr(args, "server", None) or os.environ.get(ENV_SERVER)
+
+    if explicit and servers:
+        server = servers[0]
+        # Root dir unknown for explicit URLs: the notebook path must be
+        # given relative to the server root.
+        if args.notebook is None:
+            _die("notebook attach: --server requires an explicit notebook PATH")
+        rel = args.notebook
+        if Path(rel).is_absolute():
+            if server.root_dir is None:
+                _die(
+                    "notebook attach: pass the notebook path relative to the "
+                    "server root when using --server"
+                )
+            rel = notebook_rel_path(Path(rel), server)
+        nb_display = rel
+    else:
+        nb_path = _resolve_notebook_path(args.notebook, args)
+        server = server_for_path(servers, nb_path)
+        if server is None:
+            _die(
+                "notebook attach: no running jupyter server owns this notebook. "
+                "Start one with `labsh` (foreground) or `labsh start` (background)."
+            )
+        rel = notebook_rel_path(nb_path, server)
+        nb_display = str(nb_path)
+
+    client = ServerClient(server)
+
+    def served_rows() -> list[Kernel]:
+        try:
+            served = discover_server_kernels(server)
+        except RuntimeError:
+            return []
+        hits = [
+            k
+            for k in served
+            if k.notebook_path is not None
+            and str(k.notebook_path).endswith(rel)
+        ]
+        if not hits:
+            return []
+        # Enrich with local pids where visible; keep only the hits (the merge
+        # also returns unmatched local kernels, which are not ours to show).
+        hit_ids = {k.kernel_id for k in hits}
+        merged = merge_kernels(discover_kernels(), hits)
+        return [k for k in merged if k.kernel_id in hit_ids]
+
+    existing = [k for k in served_rows() if k.native]
     if existing:
         _print_table([k.as_row() for k in existing])
         return 0
-    # Create a new session via the REST API.
-    url = f"{server.api_base}/api/sessions"
-    body = {
-        "kernel": {"name": args.kernel_name or "python3"},
-        "name": nb_path.name,
-        "path": rel,
-        "type": "notebook",
-    }
-    headers = {"Content-Type": "application/json"}
-    if server.token:
-        headers["Authorization"] = f"token {server.token}"
-    req = urllib.request.Request(
-        url, data=json.dumps(body).encode(), method="POST", headers=headers
-    )
-    ctx = ssl._create_unverified_context() if server.secure else None
+
     try:
-        with urllib.request.urlopen(req, context=ctx) as r:
-            data = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        _die(
-            f"notebook attach: POST /api/sessions failed: "
-            f"HTTP {e.code} {e.read().decode(errors='replace')}"
+        data = client.create_session(
+            rel, Path(rel).name, args.kernel_name or "python3"
         )
-    except urllib.error.URLError as e:
-        _die(f"notebook attach: cannot reach labsh server: {e}")
-    # Give the kernel a moment to start before scanning again.
+    except RuntimeError as e:
+        _die(f"notebook attach: {e}")
     kernel_id = (data.get("kernel") or {}).get("id", "?")
-    eprint(f"labsh: created session for {rel} (kernel id {kernel_id})")
+    eprint(f"labsh: created session for {nb_display} (kernel id {kernel_id})")
     for _ in range(20):
         time.sleep(0.25)
-        new_kernels = discover_kernels()
-        hits = [k for k in new_kernels if k.notebook_path == nb_path]
+        hits = [k for k in served_rows() if k.kernel_id == kernel_id]
         if hits:
             _print_table([k.as_row() for k in hits])
             return 0
-    eprint("labsh: session created but kernel did not appear in process scan yet")
+    eprint("labsh: session created but kernel did not appear yet")
     return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    servers = discover_servers()
+    servers = _servers_for(args)
     if servers:
         rows = [
             {
-                "PID": str(s.pid),
+                "PID": str(s.pid) if s.pid else "-",
                 "URL": s.url,
-                "ROOT": str(s.root_dir),
+                "ROOT": str(s.root_dir) if s.root_dir else "-",
                 "TOKEN": "(set)" if s.token else "(none)",
+                "SRC": s.source,
             }
             for s in servers
         ]
@@ -1074,7 +1832,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         _print_table(rows)
     else:
         print("servers: (none)")
-    kernels = discover_kernels()
+    kernels = gather_kernels(args)
     if kernels:
         print()
         print("kernels:")
@@ -1085,18 +1843,104 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _live_kernel_rows(server: LabServer) -> list[dict[str, str]] | None:
+    """Kernels the server currently manages, for the stop guardrail.
+
+    Returns a row per kernel (id, spec, execution state, connected websocket
+    clients, last activity, owning notebook) — or None when the server cannot
+    be queried at all (dead or wedged), in which case there is nothing left
+    to protect and a bounce is the remedy.
+    """
+    try:
+        client = ServerClient(server)
+        # Short timeout: a healthy server answers these GETs in milliseconds.
+        # If it can't answer within 5s it is wedged, and the whole point of
+        # the None return is that a wedged server must stay stoppable fast.
+        kernels = client.kernels(timeout=5.0)
+        sessions = client.sessions(timeout=5.0)
+    except RuntimeError:
+        return None
+    nb_by_kid: dict[str, str] = {}
+    for sess in sessions:
+        kid = (sess.get("kernel") or {}).get("id")
+        if kid:
+            nb_by_kid[kid] = sess.get("path") or ""
+    return [
+        {
+            "ID": (k.get("id") or "")[:8],
+            "KERNEL": k.get("name") or "-",
+            "STATE": k.get("execution_state") or "-",
+            "CONNECTIONS": str(k.get("connections", "-")),
+            "LAST_ACTIVITY": k.get("last_activity") or "-",
+            "NOTEBOOK": nb_by_kid.get(k.get("id") or "") or "-",
+        }
+        for k in kernels
+    ]
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
+    # Deliberately project-scoped discovery: `stop` must never signal a
+    # workspace-wide parent server found by walk-up discovery.
     servers = discover_servers()
     if not servers:
         eprint("labsh: no running labsh server to stop")
         return 1
-    for s in servers:
-        if args.all or s.root_dir.resolve() == PROJECT_DIR.resolve():
-            try:
-                os.kill(s.pid, signal.SIGTERM)
-                eprint(f"labsh: sent SIGTERM to labsh server pid {s.pid}")
-            except ProcessLookupError:
-                eprint(f"labsh: pid {s.pid} already gone")
+    targets = [
+        s
+        for s in servers
+        if args.all
+        or (s.root_dir.resolve() if s.root_dir else None) == PROJECT_DIR.resolve()
+    ]
+    if not targets:
+        eprint("labsh: no running labsh server owns this project")
+        return 1
+
+    # Guardrail: shutting down the server shuts down every kernel it manages
+    # (jupyter_server's cleanup_kernels → shutdown_all), destroying all
+    # in-memory state — hours of interactive work in the worst case. Refuse
+    # while live kernels exist unless --force. A server that cannot be
+    # queried has nothing left to protect: proceed, a bounce is the remedy.
+    if not getattr(args, "force", False):
+        blocked = False
+        for s in targets:
+            rows = _live_kernel_rows(s)
+            if rows is None:
+                eprint(
+                    f"labsh: server pid {s.pid} is not answering its REST API — "
+                    "cannot enumerate kernels, proceeding with stop"
+                )
+                continue
+            if rows:
+                blocked = True
+                eprint(
+                    f"labsh: REFUSING to stop server pid {s.pid} ({s.url}): "
+                    f"{len(rows)} live kernel(s) would be killed and their "
+                    "in-memory state destroyed:"
+                )
+                _print_table(rows, stream=sys.stderr)
+        if blocked:
+            eprint("labsh: to stop anyway (kills these kernels): labsh stop --force")
+            eprint(
+                "labsh: nothing was stopped. Save what matters first "
+                "(e.g. write results to disk from the kernel)."
+            )
+            return 3
+
+    stopped = 0
+    for s in targets:
+        try:
+            os.kill(s.pid, signal.SIGTERM)  # type: ignore[arg-type]
+            eprint(f"labsh: sent SIGTERM to labsh server pid {s.pid}")
+            stopped += 1
+        except ProcessLookupError:
+            eprint(f"labsh: pid {s.pid} already gone")
+    if stopped:
+        # bin/labsh's background pidfile is now stale; clean it up here
+        # (the shell wrapper exec's into this helper, so it cannot).
+        try:
+            (JUPYTER_CONFIG_DIR / "labsh.bg.pid").unlink()
+        except OSError:
+            pass
     return 0
 
 
@@ -1109,12 +1953,31 @@ def _add_selector(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "-n",
         "--notebook",
-        help="Select by notebook path/glob/substring (resolved against running kernels' jupyter_session)",
+        help="Select by notebook path/glob/substring (resolved against running kernels' notebooks)",
     )
     p.add_argument(
         "-k",
         "--kernel",
         help="Select by kernel PID, short id, or connection file path",
+    )
+
+
+def _add_server_opts(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--server",
+        default=None,
+        help=f"Target a specific jupyter server by URL (env: {ENV_SERVER}); "
+        "token from --token, env, or ?token= in the URL",
+    )
+    p.add_argument(
+        "--token",
+        default=None,
+        help=f"Auth token for --server (env: {ENV_TOKEN})",
+    )
+    p.add_argument(
+        "--local",
+        action="store_true",
+        help="Force the connection-file/ZMQ path (skip server REST/websocket)",
     )
 
 
@@ -1140,40 +2003,57 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sk.add_parser("ps", help="List running kernels")
     p.add_argument("--all-users", action="store_true")
+    _add_server_opts(p)
     p.set_defaults(func=cmd_kernel_ps)
 
     p = sk.add_parser("find", help="Resolve a notebook pattern to kernel(s)")
     p.add_argument("query")
+    _add_server_opts(p)
     p.set_defaults(func=cmd_kernel_find)
 
     p = sk.add_parser("exec", help="Execute code in a live kernel")
     _add_selector(p)
+    _add_server_opts(p)
     _add_code_inputs(p)
     p.set_defaults(func=cmd_kernel_exec)
 
     p = sk.add_parser("inspect", help="Print a 'whos'-style summary of user globals")
     _add_selector(p)
+    _add_server_opts(p)
     p.add_argument("pattern", nargs="?", default="")
     p.add_argument("-t", "--timeout", type=float, default=30.0)
     p.set_defaults(func=cmd_kernel_inspect)
 
+    p = sk.add_parser("interrupt", help="Interrupt a running kernel")
+    _add_selector(p)
+    _add_server_opts(p)
+    p.set_defaults(func=cmd_kernel_interrupt)
+
+    p = sk.add_parser("restart", help="Restart a kernel (server-managed only; clears state)")
+    _add_selector(p)
+    _add_server_opts(p)
+    p.set_defaults(func=cmd_kernel_restart)
+
     # --- notebook --------------------------------------------------------------
-    p_n = sub.add_parser("notebook", help="Read and edit notebook files via the running labsh server")
+    p_n = sub.add_parser("notebook", help="Read and edit notebook files via the running jupyter server")
     sn = p_n.add_subparsers(dest="cmd", required=True)
 
     p = sn.add_parser("cells", help="List cells (idx, type, snippet)")
     p.add_argument("-n", "--notebook")
+    _add_server_opts(p)
     p.set_defaults(func=cmd_notebook_cells)
 
     p = sn.add_parser("show", help="Show a single cell's source and outputs")
     p.add_argument("-n", "--notebook")
     p.add_argument("index", type=int)
+    _add_server_opts(p)
     p.set_defaults(func=cmd_notebook_show)
 
     p = sn.add_parser("append", help="Append a cell, optionally execute it in the live kernel")
     p.add_argument("-n", "--notebook")
     p.add_argument("--markdown", action="store_true")
     p.add_argument("--execute", action="store_true")
+    _add_server_opts(p)
     _add_code_inputs(p)
     p.set_defaults(func=cmd_notebook_append)
 
@@ -1181,20 +2061,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-n", "--notebook")
     p.add_argument("index", type=int)
     p.add_argument("--execute", action="store_true")
+    _add_server_opts(p)
     _add_code_inputs(p)
     p.set_defaults(func=cmd_notebook_replace)
 
-    p = sn.add_parser("attach", help="Ensure a kernel is running for the given notebook (via labsh server)")
+    p = sn.add_parser("attach", help="Ensure a kernel is running for the given notebook (via jupyter server)")
     p.add_argument("notebook", nargs="?")
     p.add_argument("--kernel-name", default=None, help="kernelspec name (default: python3)")
+    _add_server_opts(p)
     p.set_defaults(func=cmd_notebook_attach)
 
     # --- status / stop ---------------------------------------------------------
-    p = sub.add_parser("status", help="Show running labsh servers and kernels")
+    p = sub.add_parser("status", help="Show running jupyter servers and kernels")
+    _add_server_opts(p)
     p.set_defaults(func=cmd_status, group="status", cmd="status")
 
     p = sub.add_parser("stop", help="Stop background labsh server(s) owning this project")
-    p.add_argument("--all", action="store_true", help="Stop every discoverable labsh server, not just this project's")
+    p.add_argument("--all", action="store_true", help="Stop every project-local labsh server, not just this project's")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Stop even when live kernels exist (kills them and destroys their in-memory state)",
+    )
     p.set_defaults(func=cmd_stop, group="stop", cmd="stop")
 
     return parser

@@ -476,6 +476,54 @@ test_token_gitignore_written() {
 }
 run_test "labsh token drops a .jupyter/.gitignore" test_token_gitignore_written
 
+# --- server env --with composition ---
+
+# Source parse_server_flags from bin/labsh to exercise how the server-env
+# package list is assembled: baseline (must ship pip for the in-UI
+# Extension Manager), the LABSH_WITH seam, and specs persisted by
+# `labsh ext install`.
+# shellcheck disable=SC1090
+source <(sed -n '/^parse_server_flags() {$/,/^}$/p' "$LAB")
+PROG=labsh
+die() { echo "die: $*" >&2; return 1; }
+find_available_port() { echo "$1"; }
+
+with_args_contain() {
+    local needle="$1"
+    case " ${WITH_ARGS[*]-} " in
+        *" --with $needle "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+test_with_args_ship_pip() {
+    EXT_FILE="/nonexistent" LABSH_WITH= IP=127.0.0.1 parse_server_flags
+    with_args_contain pip
+}
+run_test "server env: baseline --with list ships pip" test_with_args_ship_pip
+
+test_with_args_labsh_with_seam() {
+    EXT_FILE="/nonexistent" LABSH_WITH="pkg-a pkg-b" IP=127.0.0.1 \
+        parse_server_flags
+    with_args_contain pkg-a && with_args_contain pkg-b
+}
+run_test "server env: LABSH_WITH packages become --with args" \
+    test_with_args_labsh_with_seam
+
+test_with_args_persisted_extensions() {
+    local d="$UNIT_WORK_DIR/withargs-ext"
+    mkdir -p "$d"
+    printf 'jupyterlab-vim\n# a comment\n\njupyterlab-git==0.50.0\n' \
+        > "$d/labsh-extensions"
+    EXT_FILE="$d/labsh-extensions" LABSH_WITH= IP=127.0.0.1 \
+        parse_server_flags
+    with_args_contain jupyterlab-vim \
+        && with_args_contain "jupyterlab-git==0.50.0" \
+        && ! with_args_contain "# a comment"
+}
+run_test "server env: persisted ext specs included, comments skipped" \
+    test_with_args_persisted_extensions
+
 echo
 echo "test-labsh: unit tests done — $pass/$total passed"
 echo
@@ -525,7 +573,7 @@ mkdir -p "$INTEG_JUPYTER_CONFIG_DIR" "$INTEG_JUPYTER_DATA_DIR" "$INTEG_RUNTIME_D
 
 uv venv --python "$LAB_PYTHON" "$INTEG_VENV_DIR" >/dev/null 2>&1
 uv pip install --python "$INTEG_VENV_DIR/bin/python" \
-    jupyterlab ipykernel psutil nbformat 2>&1 | tail -1
+    jupyterlab ipykernel psutil nbformat websocket-client 2>&1 | tail -1
 
 cat > "$INTEG_WORK_DIR/hello.ipynb" <<'NB'
 {
@@ -633,6 +681,49 @@ test_exec_stdin() {
 }
 run_test "kernel exec from stdin via -f -" test_exec_stdin
 
+test_exec_resolution_no_fs_walk() {
+    # Regression for the `kernel exec -n <name>` empty-output hang: notebook
+    # resolution used to glob PROJECT_DIR.rglob(<name>), an unbounded
+    # recursive walk. Invoked from a high-up cwd on a large NFS tree (exactly
+    # how the root-server wrappers call labsh) that walk took minutes, so exec
+    # appeared to hang and return nothing — before a single byte of code ever
+    # reached the kernel. Resolution must instead match the query against the
+    # notebook paths the kernels already carry, touching the filesystem at
+    # most for a single stat, never a walk. Here we booby-trap Path.rglob to
+    # raise: a basename query must still resolve to the right kernel with the
+    # walk never happening.
+    HELPER_DIR="$(dirname "$HELPER")" "$INTEG_VENV_DIR/bin/python" - <<'PY'
+import os, sys, pathlib
+sys.path.insert(0, os.environ["HELPER_DIR"])
+import _labsh_kernel as L
+
+def _boom(*a, **k):
+    raise AssertionError("notebook resolution walked the filesystem (rglob)")
+
+pathlib.Path.rglob = _boom  # any filesystem walk during resolution is a regression
+
+k = L.Kernel(
+    pid=4242,
+    username="tester",
+    connection_file=None,
+    short_id="dead1234",
+    kernelspec="python3",
+    notebook_path=pathlib.Path("/some/deep/unreachable/dir/hello.ipynb"),
+    server=None,
+    kernel_id="dead1234-0000-0000-0000-000000000000",
+)
+m = L._match_notebook([k], "hello.ipynb")
+assert len(m) == 1 and m[0].short_id == "dead1234", f"unexpected match: {m}"
+
+# Substring form must also resolve without a walk.
+m2 = L._match_notebook([k], "unreachable/dir/hello.ipynb")
+assert len(m2) == 1 and m2[0].short_id == "dead1234", f"unexpected substring match: {m2}"
+print("ok")
+PY
+}
+run_test "kernel exec resolves by known notebook path, never a filesystem walk" \
+    test_exec_resolution_no_fs_walk
+
 test_exec_auto_select() {
     # With a single running kernel, -n/-k should not be required.
     # Skip if other kernels are running (shared systems).
@@ -724,6 +815,217 @@ test_nb_replace() {
     lab_py notebook show -n "$INTEG_WORK_DIR/hello.ipynb" 0 2>&1 | grep -q "x = 999"
 }
 run_test "notebook replace rewrites cell" test_nb_replace
+
+# ── Native server path (REST + kernel websocket) ──────────────────────────
+
+SRV_URL="http://127.0.0.1:$PORT"
+
+test_native_ps() {
+    lab_py kernel ps --server "$SRV_URL" --token "$TOKEN" 2>&1 | grep -q "hello.ipynb"
+}
+run_test "native: kernel ps --server lists served session" test_native_ps
+
+test_native_exec() {
+    lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
+        -n hello.ipynb "print('native_hi')" 2>&1 | grep -q "native_hi"
+}
+run_test "native: kernel exec over websocket" test_native_exec
+
+test_native_state_cross_transport() {
+    # State set through the server websocket must be visible over ZMQ:
+    # both transports drive the same kernel.
+    lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
+        -n hello.ipynb "native_var = 777" >/dev/null 2>&1
+    lab_py kernel exec --local -n hello.ipynb "print(native_var)" 2>&1 | grep -q "777"
+}
+run_test "native: state persists across websocket and ZMQ transports" \
+    test_native_state_cross_transport
+
+test_native_error_exit() {
+    ! lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
+        -n hello.ipynb "1/0" 2>/dev/null
+}
+run_test "native: exec error returns non-zero" test_native_error_exit
+
+test_native_error_traceback() {
+    local err
+    err="$(lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
+        -n hello.ipynb "1/0" 2>&1 || true)"
+    echo "$err" | grep -q "ZeroDivisionError"
+}
+run_test "native: exec error includes traceback" test_native_error_traceback
+
+test_native_inspect() {
+    lab_py kernel inspect --server "$SRV_URL" --token "$TOKEN" \
+        -n hello.ipynb 2>&1 | grep -q "native_var"
+}
+run_test "native: kernel inspect over websocket" test_native_inspect
+
+test_native_bad_token() {
+    ! lab_py kernel ps --server "$SRV_URL" --token "wrong-token" 2>/dev/null
+}
+run_test "native: wrong token is rejected" test_native_bad_token
+
+test_native_env_server() {
+    LABSH_SERVER="$SRV_URL" LABSH_TOKEN="$TOKEN" \
+        lab_py kernel exec -n hello.ipynb "print('env_native')" 2>&1 | grep -q "env_native"
+}
+run_test "native: LABSH_SERVER/LABSH_TOKEN env vars" test_native_env_server
+
+test_native_token_in_url() {
+    lab_py kernel ps --server "$SRV_URL/?token=$TOKEN" 2>&1 | grep -q "hello.ipynb"
+}
+run_test "native: token embedded in --server URL" test_native_token_in_url
+
+test_local_flag_forces_zmq() {
+    lab_py kernel exec --local -n hello.ipynb "print('zmq_path')" 2>&1 | grep -q "zmq_path"
+}
+run_test "fallback: --local forces connection-file/ZMQ path" test_local_flag_forces_zmq
+
+test_server_local_conflict() {
+    ! lab_py kernel exec --server "$SRV_URL" --local -n hello.ipynb "1" 2>/dev/null
+}
+run_test "native: --server with --local is refused" test_server_local_conflict
+
+test_nb_append_execute_native() {
+    lab_py notebook append --execute --server "$SRV_URL" --token "$TOKEN" \
+        -n hello.ipynb "print('native_append')" 2>&1
+    python3 -c "
+import json, sys
+nb = json.load(open('$INTEG_WORK_DIR/hello.ipynb'))
+last = nb['cells'][-1]
+print(json.dumps(last.get('outputs', [])))
+" | grep -q "native_append"
+}
+run_test "native: notebook append --execute persists output" test_nb_append_execute_native
+
+test_kernel_interrupt() {
+    lab_py kernel interrupt -n hello.ipynb 2>&1 | grep -q "interrupted"
+}
+run_test "native: kernel interrupt succeeds" test_kernel_interrupt
+
+# ── kernel resilience ──────────────────────────────────────────────────────
+# Regression for the 2026-07-06 root-jupyterlab incident: prove that labsh
+# CLIENT operations can never signal/stop the server or its kernels — the
+# server pid must be unchanged and kernel state intact after a barrage of
+# every read/exec verb.
+
+test_client_ops_leave_server_alive() {
+    lab_py kernel exec -n hello.ipynb "survivor = 12345" >/dev/null 2>&1
+    local i
+    for i in 1 2 3; do
+        lab_py kernel ps >/dev/null 2>&1
+        lab_py kernel find hello.ipynb >/dev/null 2>&1
+        lab_py status >/dev/null 2>&1
+        lab_py kernel inspect -n hello.ipynb >/dev/null 2>&1
+        lab_py notebook cells -n "$INTEG_WORK_DIR/hello.ipynb" >/dev/null 2>&1
+        lab_py kernel exec --server "http://127.0.0.1:$PORT" --token "$TOKEN" \
+            -n hello.ipynb "survivor += 0" >/dev/null 2>&1
+        lab_py kernel exec --local -n hello.ipynb "survivor += 0" >/dev/null 2>&1
+    done
+    kill -0 "$SERVER_PID" 2>/dev/null || return 1
+    lab_py kernel exec -n hello.ipynb "print(survivor)" 2>&1 | grep -q "12345"
+}
+run_test "resilience: client ops never signal server; state survives" \
+    test_client_ops_leave_server_alive
+
+# ── ext install: extensions land in the RUNNING server env, no restart ─────
+
+test_ext_install_no_server_fails() {
+    # env -u: the integration section exports JUPYTER_CONFIG_DIR/DATA_DIR
+    # pointing at the live test server; this test needs a serverless project.
+    local out rc
+    out="$( (cd "$UNIT_WORK_DIR" && env -u JUPYTER_CONFIG_DIR -u JUPYTER_DATA_DIR \
+        "$LAB" ext install some-extension) 2>&1)"; rc=$?
+    [ $rc -ne 0 ] && echo "$out" | grep -q "no running labsh server"
+}
+run_test "ext install refuses without a running server" test_ext_install_no_server_fails
+
+test_ext_install_hot_loads() {
+    local pid_before="$SERVER_PID"
+    (cd "$INTEG_WORK_DIR" && "$LAB" ext install jupyterlab-night) >/dev/null 2>&1 \
+        || return 1
+    # server must NOT have been restarted
+    kill -0 "$pid_before" 2>/dev/null || return 1
+    # the labextension is in the running server's env
+    compgen -G "$INTEG_VENV_DIR/share/jupyter/labextensions/jupyterlab-night*" \
+        >/dev/null 2>&1 || return 1
+    # ...and the live server serves it on a fresh /lab page load (the
+    # no-restart contract: federated extensions enumerate per request)
+    curl -s -H "Authorization: token $TOKEN" "http://127.0.0.1:$PORT/lab" \
+        | grep -q "jupyterlab-night" || return 1
+    # persisted for future starts
+    grep -qxF "jupyterlab-night" "$INTEG_JUPYTER_CONFIG_DIR/labsh-extensions"
+}
+run_test "ext install hot-loads into running server (no restart)" \
+    test_ext_install_hot_loads
+
+test_ext_list_shows_persisted() {
+    # capture, then grep: grep -q on the live pipe SIGPIPEs labsh (pipefail)
+    local out
+    out="$( (cd "$INTEG_WORK_DIR" && "$LAB" ext list) 2>&1)"
+    echo "$out" | grep -q "jupyterlab-night"
+}
+run_test "ext list shows persisted extension" test_ext_list_shows_persisted
+
+# Keep restart LAST among kernel tests — it clears kernel state.
+test_kernel_restart_clears_state() {
+    lab_py kernel exec -n hello.ipynb "pre_restart_var = 1" >/dev/null 2>&1
+    lab_py kernel restart -n hello.ipynb >/dev/null 2>&1 || return 1
+    # Wait for the restarted kernel to answer, then check state is gone.
+    local _i
+    for _i in $(seq 1 20); do
+        if lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
+                -n hello.ipynb "print('back')" 2>/dev/null | grep -q "back"; then
+            ! lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
+                -n hello.ipynb "print(pre_restart_var)" 2>/dev/null
+            return $?
+        fi
+        sleep 1
+    done
+    return 1
+}
+run_test "native: kernel restart clears state" test_kernel_restart_clears_state
+
+# ── stop guardrail — keep these LAST: --force stops the test server ────────
+
+test_stop_refuses_live_kernels() {
+    local out rc
+    out="$(lab_py stop 2>&1)"; rc=$?
+    [ "$rc" -eq 3 ] || { echo "  stop-guard: expected exit 3, got $rc: $out" >&2; return 1; }
+    echo "$out" | grep -qi "REFUSING" \
+        || { echo "  stop-guard: no REFUSING in: $out" >&2; return 1; }
+    echo "$out" | grep -q -- "--force" \
+        || { echo "  stop-guard: no --force hint in: $out" >&2; return 1; }
+    # server and kernel state must be untouched
+    kill -0 "$SERVER_PID" 2>/dev/null \
+        || { echo "  stop-guard: server pid $SERVER_PID gone" >&2; return 1; }
+    # the kernel may still be warming from the preceding restart test —
+    # retry the state round-trip briefly
+    local _i
+    for _i in $(seq 1 10); do
+        if lab_py kernel exec -n hello.ipynb "guard_var = 7" >/dev/null 2>&1 \
+            && lab_py kernel exec -n hello.ipynb "print(guard_var)" 2>&1 | grep -q "7"; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "  stop-guard: kernel state round-trip failed after refusal" >&2
+    return 1
+}
+run_test "stop: refuses with live kernels (exit 3), server survives" \
+    test_stop_refuses_live_kernels
+
+test_stop_force_stops_server() {
+    lab_py stop --force >/dev/null 2>&1 || return 1
+    local _i
+    for _i in $(seq 1 20); do
+        kill -0 "$SERVER_PID" 2>/dev/null || return 0
+        sleep 1
+    done
+    return 1
+}
+run_test "stop: --force stops the server" test_stop_force_stops_server
 
 # ── Summary ────────────────────────────────────────────────────────────────
 
