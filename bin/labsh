@@ -15,6 +15,7 @@ LAB_LOCK_FILE="$JUPYTER_CONFIG_DIR/.labshvenv.lock"  # pinned deps for labsh hel
 BG_PID_FILE="$JUPYTER_CONFIG_DIR/labsh.bg.pid"
 BG_LOG_FILE="$JUPYTER_CONFIG_DIR/labsh.bg.log"
 TOKEN_FILE="$JUPYTER_CONFIG_DIR/token"        # stable Jupyter auth token (0600)
+EXT_FILE="$JUPYTER_CONFIG_DIR/labsh-extensions"  # extensions added via `labsh ext install`
 
 # --- NFS performance: redirect uv cache and venvs to local storage --------
 # /fh/fast/ is NFS (Isilon) with ~20ms per metadata op.  Python venv startup
@@ -96,7 +97,10 @@ USAGE
   labsh start [--https] [--port N] [--ip ADDR] [--with-ai]
                                Start JupyterLab in the background, log to
                                ./.jupyter/labsh.bg.log, return immediately
-  labsh stop                     Stop a background JupyterLab owning this project
+  labsh stop [--force]           Stop a background JupyterLab owning this project.
+                               REFUSES (exit 3) while live kernels exist —
+                               stopping the server kills every kernel and
+                               destroys their in-memory state. --force overrides.
   labsh status                   List running labsh servers and kernels
   labsh url                      Print the access URL of the running server
   labsh password                 Set a persistent password (stored in ./.jupyter)
@@ -130,6 +134,12 @@ USAGE
                                Interrupt a running kernel
   labsh kernel restart [-n NB|-k K]
                                Restart a kernel (server-managed only)
+
+  labsh ext install PKG...       Install prebuilt JupyterLab extension(s) into
+                               the RUNNING server env — loads on a browser
+                               refresh, NO restart, kernels keep running.
+                               Persisted for future starts.
+  labsh ext list                 Show persisted + live labextensions
 
   labsh notebook attach [PATH]   Ensure a kernel is running for PATH (spawns
                                a session via the labsh server if needed)
@@ -174,6 +184,29 @@ NATIVE SERVER INTERFACE
     --server URL    target one specific server (env: LABSH_SERVER);
                     token via --token, LABSH_TOKEN, or ?token= in the URL
     --local         force the connection-file/ZMQ path (skip the server)
+
+KERNEL SAFETY
+  Stopping (or restarting) the Jupyter server kills EVERY kernel it manages
+  and destroys their in-memory state — jupyter-server shuts kernels down on
+  exit, and ipykernel's parent poller exits kernels within ~1s of the server
+  dying even on SIGKILL. Kernels cannot outlive the server. Therefore:
+
+    - `labsh stop` refuses (exit 3) while the server reports live kernels,
+      listing them (state, connected clients, notebook). `labsh stop --force`
+      overrides. A server that no longer answers its REST API has nothing
+      left to protect and is stopped without the check.
+    - Prefer `labsh ext install` over a restart to add extensions.
+    - Supervisors/wrappers should never pass --force on automated bounce
+      paths; the refusal is the signal that a human decision is needed.
+
+EXTENSIONS WITHOUT RESTART
+  `labsh ext install PKG` pip-installs into the RUNNING server's environment.
+  JupyterLab enumerates prebuilt (federated) extensions at page-load time, so
+  a browser refresh activates them — no server restart, kernels keep running.
+  Installed specs persist in ./.jupyter/labsh-extensions and are re-included
+  (via --with) on every future `labsh start`. Packages that also ship a
+  jupyter SERVER extension need one deliberate restart to activate their
+  backend; labsh detects and says so.
 
 NETWORK & AUTH
   Default bind is 0.0.0.0 — reachable from other machines on the local
@@ -738,6 +771,140 @@ cmd_notebook() {
     esac
 }
 
+# Print the pid of the live labsh server for this project (from
+# jpserver-*.json in the project runtime dir), or fail.
+find_server_pid() {
+    local runtime_dir="$JUPYTER_DATA_DIR/runtime"
+    [ -d "$runtime_dir" ] || return 1
+    local jf pid
+    for jf in "$runtime_dir"/jpserver-*.json; do
+        [ -e "$jf" ] || continue
+        pid="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('pid',''))" "$jf" 2>/dev/null)" || continue
+        [ -n "$pid" ] || continue
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "$pid"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Print the python interpreter of the RUNNING server's environment, resolved
+# from the live process — works for uvx-built envs, plain venvs, anything.
+# argv[0] is the interpreter (shebang or direct); argv[1] often the
+# entry-point script living in <env>/bin.
+find_server_python() {
+    local pid="$1" argv0 argv1 cand
+    argv0="$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | sed -n 1p)"
+    argv1="$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | sed -n 2p)"
+    for cand in "$argv0" "$(dirname "${argv1:-/nonexistent}")/python"; do
+        case "$cand" in
+            *python*)
+                [ -x "$cand" ] && { echo "$cand"; return 0; } ;;
+        esac
+    done
+    return 1
+}
+
+cmd_ext() {
+    # Hot-install JupyterLab extensions into the RUNNING server's environment.
+    #
+    # Prebuilt (federated) extensions are enumerated by the server at PAGE
+    # LOAD time (jupyterlab_server scans share/jupyter/labextensions per /lab
+    # request), so a pip install into the live server env takes effect on a
+    # plain browser refresh — NO server restart, kernels keep running. Only
+    # packages that also ship a jupyter SERVER extension (REST backend) need
+    # a restart to activate that part.
+    local sub="${1:-}"
+    [ $# -gt 0 ] && shift
+    case "$sub" in
+        install|add)
+            [ $# -gt 0 ] || die "ext install: no packages specified
+Usage: labsh ext install PKG [PKG...]"
+            require_uv
+            local pid
+            pid="$(find_server_pid)" \
+                || die "ext install: no running labsh server for this project.
+Extensions are installed into the RUNNING server's environment so they load
+on a browser refresh without a restart. Start one first ('labsh start'), or
+add the spec to $EXT_FILE (one per line) — 'labsh start' includes it."
+            local srv_py
+            srv_py="$(find_server_python "$pid")" \
+                || die "ext install: cannot resolve the server env python from pid $pid"
+            echo "$PROG: installing $* into the running server env ($srv_py)" >&2
+            uv pip install --python "$srv_py" "$@" \
+                || die "ext install: uv pip install failed"
+            # Persist so future restarts include the packages via --with.
+            mkdir -p "$JUPYTER_CONFIG_DIR"
+            local pkg
+            for pkg in "$@"; do
+                grep -qxF "$pkg" "$EXT_FILE" 2>/dev/null || echo "$pkg" >> "$EXT_FILE"
+            done
+            # Classify each package: frontend labextension (refresh suffices)
+            # vs server extension (its backend needs a restart to activate).
+            local needs_restart=0 name
+            for pkg in "$@"; do
+                # strip version specifiers / extras to the bare project name
+                name="$(printf '%s' "$pkg" | sed -E 's/[<>=!~[;].*$//')"
+                LABSH_PKG="$name" "$srv_py" - <<'PYEOF' || needs_restart=1
+import os, sys
+from importlib.metadata import files, PackageNotFoundError
+name = os.environ["LABSH_PKG"]
+try:
+    fs = [str(f) for f in (files(name) or [])]
+except PackageNotFoundError:
+    sys.exit(0)  # can't classify; assume frontend-only
+lab = any("share/jupyter/labextensions/" in f for f in fs)
+srv = any("etc/jupyter/jupyter_server_config.d/" in f for f in fs)
+if lab:
+    print(f"labsh:   {name}: frontend extension — loads on browser refresh", file=sys.stderr)
+if srv:
+    print(f"labsh:   {name}: also a SERVER extension — backend needs a restart", file=sys.stderr)
+sys.exit(1 if srv else 0)
+PYEOF
+            done
+            echo "$PROG: done. Refresh the browser tab to load the extension(s)." >&2
+            echo "$PROG: persisted to $EXT_FILE (future 'labsh start' includes them)." >&2
+            if [ "$needs_restart" -eq 1 ]; then
+                echo "$PROG: NOTE: at least one package ships a server extension; its" >&2
+                echo "$PROG: backend only activates on the next server restart. The" >&2
+                echo "$PROG: frontend part still loads on refresh. Restart deliberately" >&2
+                echo "$PROG: when kernels are safe to lose: labsh stop && labsh start" >&2
+            fi
+            ;;
+        list|ls)
+            if [ -s "$EXT_FILE" ]; then
+                echo "$PROG: extensions persisted in $EXT_FILE:" >&2
+                sed 's/^/  /' "$EXT_FILE"
+            else
+                echo "$PROG: no extensions persisted via 'labsh ext install'" >&2
+            fi
+            local pid srv_py labext_dir
+            if pid="$(find_server_pid)" && srv_py="$(find_server_python "$pid")"; then
+                labext_dir="$(dirname "$(dirname "$srv_py")")/share/jupyter/labextensions"
+                if [ -d "$labext_dir" ]; then
+                    echo "$PROG: labextensions in the running server env:" >&2
+                    find "$labext_dir" -mindepth 1 -maxdepth 2 -name package.json 2>/dev/null \
+                        | sed -e 's|/package.json$||' -e "s|^$labext_dir/|  |"
+                fi
+            fi
+            ;;
+        ""|help|-h|--help)
+            cat >&2 <<'EXTHELP'
+Usage:
+  labsh ext install PKG [PKG...]   Install prebuilt JupyterLab extension(s)
+                                   into the RUNNING server env. Frontend
+                                   extensions load on a browser refresh — no
+                                   server restart, kernels keep running.
+                                   Persisted to .jupyter/labsh-extensions so
+                                   future starts include them.
+  labsh ext list                   Show persisted + live labextensions
+EXTHELP
+            ;;
+        *) die "ext: unknown subcommand '$sub' (try '$PROG ext help')" ;;
+    esac
+}
+
 ensure_ssl_cert() {
     # Generate a self-signed cert under .jupyter/ssl/ if none exists.
     # Returns 0 and sets JUPYTER_CERTFILE / JUPYTER_KEYFILE.
@@ -919,6 +1086,15 @@ parse_server_flags() {
     if [ "$WITH_AI" -eq 1 ]; then
         WITH_ARGS+=(--with notebook-intelligence)
     fi
+    # Extensions previously hot-installed via `labsh ext install` persist in
+    # $EXT_FILE (one spec per line) so they survive a server rebuild.
+    if [ -f "$EXT_FILE" ]; then
+        local _ext
+        while IFS= read -r _ext || [ -n "$_ext" ]; do
+            case "$_ext" in ''|\#*) continue ;; esac
+            WITH_ARGS+=(--with "$_ext")
+        done < "$EXT_FILE"
+    fi
 
     if [ "$USE_HTTPS" -eq 1 ]; then
         ensure_ssl_cert
@@ -1010,9 +1186,10 @@ cmd_start() {
 }
 
 cmd_stop() {
+    # The helper refuses (exit 3) when live kernels would be killed, unless
+    # --force. It also cleans up the background pidfile on success (this
+    # wrapper exec's into it, so it cannot do that here).
     run_helper_fast stop "$@"
-    # Also clean up our pidfile.
-    rm -f "$BG_PID_FILE" 2>/dev/null
 }
 
 cmd_status() {
@@ -1132,6 +1309,7 @@ main() {
             cat "$VERSION_FILE" 2>/dev/null || echo "unknown" ;;
         help|-h|--help)  usage ;;
         kernel)          shift; cmd_kernel   "$@" ;;
+        ext|extension)   shift; cmd_ext      "$@" ;;
         notebook)        shift; cmd_notebook "$@" ;;
         start)           shift; cmd_start    "$@" ;;
         stop)            shift; cmd_stop     "$@" ;;

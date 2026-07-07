@@ -1783,6 +1783,38 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _live_kernel_rows(server: LabServer) -> list[dict[str, str]] | None:
+    """Kernels the server currently manages, for the stop guardrail.
+
+    Returns a row per kernel (id, spec, execution state, connected websocket
+    clients, last activity, owning notebook) — or None when the server cannot
+    be queried at all (dead or wedged), in which case there is nothing left
+    to protect and a bounce is the remedy.
+    """
+    try:
+        client = ServerClient(server)
+        kernels = client.kernels()
+        sessions = client.sessions()
+    except RuntimeError:
+        return None
+    nb_by_kid: dict[str, str] = {}
+    for sess in sessions:
+        kid = (sess.get("kernel") or {}).get("id")
+        if kid:
+            nb_by_kid[kid] = sess.get("path") or ""
+    return [
+        {
+            "ID": (k.get("id") or "")[:8],
+            "KERNEL": k.get("name") or "-",
+            "STATE": k.get("execution_state") or "-",
+            "CONNECTIONS": str(k.get("connections", "-")),
+            "LAST_ACTIVITY": k.get("last_activity") or "-",
+            "NOTEBOOK": nb_by_kid.get(k.get("id") or "") or "-",
+        }
+        for k in kernels
+    ]
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     # Deliberately project-scoped discovery: `stop` must never signal a
     # workspace-wide parent server found by walk-up discovery.
@@ -1790,14 +1822,62 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if not servers:
         eprint("labsh: no running labsh server to stop")
         return 1
-    for s in servers:
-        root = s.root_dir.resolve() if s.root_dir else None
-        if args.all or root == PROJECT_DIR.resolve():
-            try:
-                os.kill(s.pid, signal.SIGTERM)  # type: ignore[arg-type]
-                eprint(f"labsh: sent SIGTERM to labsh server pid {s.pid}")
-            except ProcessLookupError:
-                eprint(f"labsh: pid {s.pid} already gone")
+    targets = [
+        s
+        for s in servers
+        if args.all
+        or (s.root_dir.resolve() if s.root_dir else None) == PROJECT_DIR.resolve()
+    ]
+    if not targets:
+        eprint("labsh: no running labsh server owns this project")
+        return 1
+
+    # Guardrail: shutting down the server shuts down every kernel it manages
+    # (jupyter_server's cleanup_kernels → shutdown_all), destroying all
+    # in-memory state — hours of interactive work in the worst case. Refuse
+    # while live kernels exist unless --force. A server that cannot be
+    # queried has nothing left to protect: proceed, a bounce is the remedy.
+    if not getattr(args, "force", False):
+        blocked = False
+        for s in targets:
+            rows = _live_kernel_rows(s)
+            if rows is None:
+                eprint(
+                    f"labsh: server pid {s.pid} is not answering its REST API — "
+                    "cannot enumerate kernels, proceeding with stop"
+                )
+                continue
+            if rows:
+                blocked = True
+                eprint(
+                    f"labsh: REFUSING to stop server pid {s.pid} ({s.url}): "
+                    f"{len(rows)} live kernel(s) would be killed and their "
+                    "in-memory state destroyed:"
+                )
+                _print_table(rows, stream=sys.stderr)
+        if blocked:
+            eprint("labsh: to stop anyway (kills these kernels): labsh stop --force")
+            eprint(
+                "labsh: nothing was stopped. Save what matters first "
+                "(e.g. write results to disk from the kernel)."
+            )
+            return 3
+
+    stopped = 0
+    for s in targets:
+        try:
+            os.kill(s.pid, signal.SIGTERM)  # type: ignore[arg-type]
+            eprint(f"labsh: sent SIGTERM to labsh server pid {s.pid}")
+            stopped += 1
+        except ProcessLookupError:
+            eprint(f"labsh: pid {s.pid} already gone")
+    if stopped:
+        # bin/labsh's background pidfile is now stale; clean it up here
+        # (the shell wrapper exec's into this helper, so it cannot).
+        try:
+            (JUPYTER_CONFIG_DIR / "labsh.bg.pid").unlink()
+        except OSError:
+            pass
     return 0
 
 
@@ -1935,6 +2015,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("stop", help="Stop background labsh server(s) owning this project")
     p.add_argument("--all", action="store_true", help="Stop every project-local labsh server, not just this project's")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Stop even when live kernels exist (kills them and destroys their in-memory state)",
+    )
     p.set_defaults(func=cmd_stop, group="stop", cmd="stop")
 
     return parser

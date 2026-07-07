@@ -109,7 +109,9 @@ ssh -L 8888:localhost:8888 user@host
 |------------------------|-------------|
 | `labsh`                  | Run JupyterLab in foreground (for tmux pane) |
 | `labsh start [--https] [--port N] [--ip ADDR]` | Daemonize, log to `.jupyter/labsh.bg.log` |
-| `labsh stop`             | SIGTERM the labsh server owning this project |
+| `labsh stop [--force]`   | SIGTERM the labsh server owning this project. Refuses (exit 3) while live kernels exist — stopping the server kills every kernel and destroys their in-memory state; `--force` overrides. |
+| `labsh ext install PKG...` | Install prebuilt JupyterLab extension(s) into the **running** server env — loads on a browser refresh, no restart, kernels keep running. Persisted in `.jupyter/labsh-extensions` for future starts. Packages that also ship a *server* extension need one deliberate restart for the backend part; labsh detects and says so. |
+| `labsh ext list`         | Show persisted + live labextensions |
 | `labsh status`           | Show running servers and kernels |
 | `labsh url`              | Print the running server's access URL (with token) |
 | `labsh token [--rotate\|--path]` | Print, rotate, or locate the stable auth token at `.jupyter/token` |

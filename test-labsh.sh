@@ -856,6 +856,70 @@ test_kernel_interrupt() {
 }
 run_test "native: kernel interrupt succeeds" test_kernel_interrupt
 
+# ── kernel resilience ──────────────────────────────────────────────────────
+# Regression for the 2026-07-06 root-jupyterlab incident: prove that labsh
+# CLIENT operations can never signal/stop the server or its kernels — the
+# server pid must be unchanged and kernel state intact after a barrage of
+# every read/exec verb.
+
+test_client_ops_leave_server_alive() {
+    lab_py kernel exec -n hello.ipynb "survivor = 12345" >/dev/null 2>&1
+    local i
+    for i in 1 2 3; do
+        lab_py kernel ps >/dev/null 2>&1
+        lab_py kernel find hello.ipynb >/dev/null 2>&1
+        lab_py status >/dev/null 2>&1
+        lab_py kernel inspect -n hello.ipynb >/dev/null 2>&1
+        lab_py notebook cells -n "$INTEG_WORK_DIR/hello.ipynb" >/dev/null 2>&1
+        lab_py kernel exec --server "http://127.0.0.1:$PORT" --token "$TOKEN" \
+            -n hello.ipynb "survivor += 0" >/dev/null 2>&1
+        lab_py kernel exec --local -n hello.ipynb "survivor += 0" >/dev/null 2>&1
+    done
+    kill -0 "$SERVER_PID" 2>/dev/null || return 1
+    lab_py kernel exec -n hello.ipynb "print(survivor)" 2>&1 | grep -q "12345"
+}
+run_test "resilience: client ops never signal server; state survives" \
+    test_client_ops_leave_server_alive
+
+# ── ext install: extensions land in the RUNNING server env, no restart ─────
+
+test_ext_install_no_server_fails() {
+    # env -u: the integration section exports JUPYTER_CONFIG_DIR/DATA_DIR
+    # pointing at the live test server; this test needs a serverless project.
+    local out rc
+    out="$( (cd "$UNIT_WORK_DIR" && env -u JUPYTER_CONFIG_DIR -u JUPYTER_DATA_DIR \
+        "$LAB" ext install some-extension) 2>&1)"; rc=$?
+    [ $rc -ne 0 ] && echo "$out" | grep -q "no running labsh server"
+}
+run_test "ext install refuses without a running server" test_ext_install_no_server_fails
+
+test_ext_install_hot_loads() {
+    local pid_before="$SERVER_PID"
+    (cd "$INTEG_WORK_DIR" && "$LAB" ext install jupyterlab-night) >/dev/null 2>&1 \
+        || return 1
+    # server must NOT have been restarted
+    kill -0 "$pid_before" 2>/dev/null || return 1
+    # the labextension is in the running server's env
+    compgen -G "$INTEG_VENV_DIR/share/jupyter/labextensions/jupyterlab-night*" \
+        >/dev/null 2>&1 || return 1
+    # ...and the live server serves it on a fresh /lab page load (the
+    # no-restart contract: federated extensions enumerate per request)
+    curl -s -H "Authorization: token $TOKEN" "http://127.0.0.1:$PORT/lab" \
+        | grep -q "jupyterlab-night" || return 1
+    # persisted for future starts
+    grep -qxF "jupyterlab-night" "$INTEG_JUPYTER_CONFIG_DIR/labsh-extensions"
+}
+run_test "ext install hot-loads into running server (no restart)" \
+    test_ext_install_hot_loads
+
+test_ext_list_shows_persisted() {
+    # capture, then grep: grep -q on the live pipe SIGPIPEs labsh (pipefail)
+    local out
+    out="$( (cd "$INTEG_WORK_DIR" && "$LAB" ext list) 2>&1)"
+    echo "$out" | grep -q "jupyterlab-night"
+}
+run_test "ext list shows persisted extension" test_ext_list_shows_persisted
+
 # Keep restart LAST among kernel tests — it clears kernel state.
 test_kernel_restart_clears_state() {
     lab_py kernel exec -n hello.ipynb "pre_restart_var = 1" >/dev/null 2>&1
@@ -874,6 +938,46 @@ test_kernel_restart_clears_state() {
     return 1
 }
 run_test "native: kernel restart clears state" test_kernel_restart_clears_state
+
+# ── stop guardrail — keep these LAST: --force stops the test server ────────
+
+test_stop_refuses_live_kernels() {
+    local out rc
+    out="$(lab_py stop 2>&1)"; rc=$?
+    [ "$rc" -eq 3 ] || { echo "  stop-guard: expected exit 3, got $rc: $out" >&2; return 1; }
+    echo "$out" | grep -qi "REFUSING" \
+        || { echo "  stop-guard: no REFUSING in: $out" >&2; return 1; }
+    echo "$out" | grep -q -- "--force" \
+        || { echo "  stop-guard: no --force hint in: $out" >&2; return 1; }
+    # server and kernel state must be untouched
+    kill -0 "$SERVER_PID" 2>/dev/null \
+        || { echo "  stop-guard: server pid $SERVER_PID gone" >&2; return 1; }
+    # the kernel may still be warming from the preceding restart test —
+    # retry the state round-trip briefly
+    local _i
+    for _i in $(seq 1 10); do
+        if lab_py kernel exec -n hello.ipynb "guard_var = 7" >/dev/null 2>&1 \
+            && lab_py kernel exec -n hello.ipynb "print(guard_var)" 2>&1 | grep -q "7"; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "  stop-guard: kernel state round-trip failed after refusal" >&2
+    return 1
+}
+run_test "stop: refuses with live kernels (exit 3), server survives" \
+    test_stop_refuses_live_kernels
+
+test_stop_force_stops_server() {
+    lab_py stop --force >/dev/null 2>&1 || return 1
+    local _i
+    for _i in $(seq 1 20); do
+        kill -0 "$SERVER_PID" 2>/dev/null || return 0
+        sleep 1
+    done
+    return 1
+}
+run_test "stop: --force stops the server" test_stop_force_stops_server
 
 # ── Summary ────────────────────────────────────────────────────────────────
 
