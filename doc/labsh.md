@@ -135,6 +135,12 @@ ssh -L 8888:localhost:8888 user@host
 | `labsh kernel exec [-n NB\|-k K] CODE` | Execute code in a live kernel; streams stdout/stderr |
 | `labsh kernel exec [-n NB\|-k K] -f FILE` | Execute code from a file (`-` for stdin) |
 | `labsh kernel inspect [-n NB\|-k K] [PATTERN]` | `%whos`-style listing of live variables |
+| `labsh kernel interrupt [-n NB\|-k K]` | Interrupt a running kernel (server REST, or SIGINT fallback) |
+| `labsh kernel restart [-n NB\|-k K]` | Restart a kernel via its server (clears state) |
+
+All runtime commands also accept `--server URL` / `--token TOK` (env:
+`LABSH_SERVER`, `LABSH_TOKEN`) to target one specific Jupyter server, and
+`--local` to force the direct connection-file/ZMQ path.
 
 ### Notebook editing
 
@@ -166,18 +172,37 @@ that kernel is auto-selected.
 
 ## How Discovery Works
 
-Kernels are found by scanning processes for `python -m ipykernel_launcher -f <path>`. The `<path>` argument is the kernel's
-connection file, which contains ZMQ ports, HMAC key, and (on modern
-`jupyter_server` >= 2.0) the `jupyter_session` field that maps to the
-absolute notebook path. This works inside any sandbox regardless of
-`JUPYTER_RUNTIME_DIR` because the path is right there on the process
-cmdline.
+labsh prefers to interface with a running Jupyter *server* natively.
+Running servers are discovered by reading `jpserver-<pid>.json` files
+from, in order:
 
-Running labsh servers are discovered by reading `jpserver-<pid>.json`
-files in the runtime directory (`.jupyter/share/jupyter/runtime/`). Each
-file holds the server URL, token, and root directory. Only files whose
-pid is alive in the current PID namespace are considered, so stale files
-from previous sandbox sessions are ignored.
+1. the project runtime dir (`.jupyter/share/jupyter/runtime/`),
+2. each **parent** directory's `.jupyter/share/jupyter/runtime/` — so a
+   project nested under a workspace-wide server's root finds that server,
+3. the standard jupyter runtime dir (the same files `jupyter server
+   list` reads).
+
+Each file holds the server URL, token, and root directory. Only files
+whose pid is alive in the current PID namespace are considered, so stale
+files from previous sandbox sessions are ignored. An explicit
+`--server URL` (or `LABSH_SERVER`) short-circuits discovery; it is
+verified live via `GET /api/status`.
+
+For every discovered server, labsh asks `GET /api/sessions` for the
+server's own notebook↔kernel mapping and `GET /api/kernels` for
+sessionless kernels. Kernels owned by a server session execute over the
+kernel websocket (`/api/kernels/<id>/channels`, Jupyter message
+protocol) — through the server, with the server's token, over http or
+https.
+
+Kernels *not* owned by any reachable server (bare `jupyter console`, a
+kernel whose server died) are found by scanning processes for
+`python -m ipykernel_launcher -f <path>`. The `<path>` argument is the
+kernel's connection file, which contains ZMQ ports, HMAC key, and (on
+modern `jupyter_server` >= 2.0) the `jupyter_session` field that maps to
+the absolute notebook path. This works inside any sandbox regardless of
+`JUPYTER_RUNTIME_DIR` because the path is right there on the process
+cmdline. `--local` forces this path even when a server is available.
 
 Notebook edits go through the running server's Contents API (not direct
 file writes). This ensures JupyterLab's frontend picks up the change
@@ -228,9 +253,9 @@ resolve the ambiguity before attempting `kernel exec`.
 ## Requirements
 
 `uv` on PATH. Lab maintains its own helper venv (`.jupyter/.labshvenv`,
-symlinked to `/tmp` for performance) with `psutil`, `jupyter_client`, and
-`nbformat`. This is separate from the project `.venv`, which only gets
-`ipykernel` via `labsh kernel add`.
+symlinked to `/tmp` for performance) with `psutil`, `jupyter_client`,
+`nbformat`, and `websocket-client`. This is separate from the project
+`.venv`, which only gets `ipykernel` via `labsh kernel add`.
 
 ## NFS Performance
 

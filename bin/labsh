@@ -126,6 +126,10 @@ USAGE
                                `-` or `-f FILE` reads from stdin/file.
   labsh kernel inspect [-n NB|-k K] [PATTERN]
                                `whos`-style listing of live variables
+  labsh kernel interrupt [-n NB|-k K]
+                               Interrupt a running kernel
+  labsh kernel restart [-n NB|-k K]
+                               Restart a kernel (server-managed only)
 
   labsh notebook attach [PATH]   Ensure a kernel is running for PATH (spawns
                                a session via the labsh server if needed)
@@ -156,6 +160,20 @@ SELECTORS
   connection file path.
 
   With neither flag and exactly one running kernel, that kernel is used.
+
+NATIVE SERVER INTERFACE
+  Runtime kernel commands (ps, find, exec, inspect, interrupt, restart,
+  notebook attach/append/replace) interface with a running Jupyter server
+  natively: REST for discovery and session management, the kernel
+  websocket (/api/kernels/<id>/channels) for execution. Servers are
+  discovered from ./.jupyter runtime files, parent directories' .jupyter
+  trees (a workspace-wide server whose root contains this project), and
+  the standard jupyter runtime dir. Kernels without a serving session
+  fall back to the direct connection-file/ZMQ path automatically.
+
+    --server URL    target one specific server (env: LABSH_SERVER);
+                    token via --token, LABSH_TOKEN, or ?token= in the URL
+    --local         force the connection-file/ZMQ path (skip the server)
 
 NETWORK & AUTH
   Default bind is 0.0.0.0 — reachable from other machines on the local
@@ -209,6 +227,8 @@ ENVIRONMENT VARIABLES
   JUPYTER_CONFIG_DIR           default: ./.jupyter
   JUPYTER_DATA_DIR             default: ./.jupyter/share/jupyter
   LABSH_AI                     1/true → enable notebook-intelligence
+  LABSH_SERVER                 Default --server URL for runtime kernel cmds
+  LABSH_TOKEN                  Default --token for LABSH_SERVER
   UV_CACHE_DIR                 default: /tmp/uv-cache-$UID
   UV_LINK_MODE                 default: copy
 
@@ -351,7 +371,7 @@ ensure_venv_with_ipykernel() {
 
 ensure_lab_venv() {
     # Ensure labsh's own helper venv exists with psutil, jupyter_client,
-    # nbformat.  This is separate from the project .venv — labsh never
+    # nbformat, websocket-client.  This is separate from the project .venv — labsh never
     # installs packages into the project's venv (only `labsh kernel add`
     # touches .venv).
     #
@@ -380,6 +400,7 @@ ensure_lab_venv() {
     "$LAB_VENV_DIR/bin/python" -c "import psutil"         2>/dev/null || missing+=(psutil)
     "$LAB_VENV_DIR/bin/python" -c "import jupyter_client"  2>/dev/null || missing+=(jupyter_client)
     "$LAB_VENV_DIR/bin/python" -c "import nbformat"        2>/dev/null || missing+=(nbformat)
+    "$LAB_VENV_DIR/bin/python" -c "import websocket"       2>/dev/null || missing+=(websocket-client)
     if [ ${#missing[@]} -gt 0 ]; then
         if [ "$created_fresh" -eq 1 ] && [ -f "$LAB_LOCK_FILE" ]; then
             # Rebuild from lockfile for reproducibility
@@ -409,7 +430,7 @@ check_lab_venv() {
         LAB_VENV_DIR="$venv"  # update for subsequent run_helper_fast
     fi
     [ -x "$venv/bin/python" ] || return 1
-    "$venv/bin/python" -c "import psutil, jupyter_client, nbformat" 2>/dev/null
+    "$venv/bin/python" -c "import psutil, jupyter_client, nbformat, websocket" 2>/dev/null
 }
 
 run_helper() {
@@ -675,7 +696,7 @@ cmd_kernel() {
         run)         cmd_kernel_run        "$@" ;;
         list|ls)     cmd_kernel_list       "$@" ;;
         remove|rm)   cmd_kernel_remove     "$@" ;;
-        ps|find|exec|inspect)
+        ps|find|exec|inspect|interrupt|restart)
             run_helper_fast kernel "$sub" "$@" ;;
         ""|help|-h|--help)
             cat >&2 <<'KHELP'
@@ -693,6 +714,12 @@ Usage:
   labsh kernel find QUERY            Resolve a notebook path to its running kernel(s)
   labsh kernel exec [-n NB|-k K] CODE   Execute code in a running kernel
   labsh kernel inspect [-n NB|-k K]     Print live variables (%whos)
+  labsh kernel interrupt [-n NB|-k K]   Interrupt a running kernel
+  labsh kernel restart [-n NB|-k K]     Restart a kernel (server-managed only)
+
+Runtime commands accept --server URL / --token TOK (env: LABSH_SERVER,
+LABSH_TOKEN) to target a specific jupyter server, and --local to force
+the direct connection-file/ZMQ path.
 KHELP
             ;;
         *) die "kernel: unknown subcommand '$sub' (try '$PROG help')" ;;

@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.5.0] - 2026-07-06
+
+### Added — native Jupyter Server interface (REST + kernel websocket)
+
+Runtime kernel commands (`ps`, `find`, `exec`, `inspect`, `notebook
+attach/append/replace`) now interface with a running Jupyter server
+*natively* instead of reaching around it via connection files:
+
+- **Discovery**: `GET /api/sessions` supplies the server's own
+  notebook↔kernel mapping; `GET /api/kernels` covers sessionless
+  kernels. Servers are found from the project's
+  `.jupyter/share/jupyter/runtime/jpserver-*.json`, from **parent
+  directories'** `.jupyter` trees (a project nested under a
+  workspace-wide server root now finds that server), and from the
+  standard jupyter runtime dir — or targeted explicitly with
+  `--server URL` / `LABSH_SERVER` (token via `--token`, `LABSH_TOKEN`,
+  or `?token=` in the URL; verified via `GET /api/status`).
+- **Execution**: `kernel exec` / `inspect` / `notebook append
+  --execute` run through the kernel websocket
+  (`/api/kernels/<id>/channels`, Jupyter message protocol
+  `execute_request`), authenticated with the server token, over http
+  or https. Output shapes and exit codes are unchanged.
+- **Fallback**: kernels with no serving session keep working over the
+  classic connection-file/ZMQ path; `--local` forces it. `labsh stop`
+  deliberately stays project-scoped and never touches a parent
+  workspace server.
+
+### Added — `labsh kernel interrupt` / `labsh kernel restart`
+
+`POST /api/kernels/<id>/interrupt|restart` via the owning server;
+`interrupt` falls back to SIGINT for server-less local kernels.
+
+### Changed
+
+- The labsh helper venv now also carries `websocket-client` (pure
+  Python, zero transitive deps — the one new dependency backing the
+  websocket transport; `jupyter_client` offers no websocket client).
+
 ## [0.4.1] - 2026-05-07
 
 ### Fixed — kernels built against Lmod-managed Python die on startup

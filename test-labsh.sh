@@ -525,7 +525,7 @@ mkdir -p "$INTEG_JUPYTER_CONFIG_DIR" "$INTEG_JUPYTER_DATA_DIR" "$INTEG_RUNTIME_D
 
 uv venv --python "$LAB_PYTHON" "$INTEG_VENV_DIR" >/dev/null 2>&1
 uv pip install --python "$INTEG_VENV_DIR/bin/python" \
-    jupyterlab ipykernel psutil nbformat 2>&1 | tail -1
+    jupyterlab ipykernel psutil nbformat websocket-client 2>&1 | tail -1
 
 cat > "$INTEG_WORK_DIR/hello.ipynb" <<'NB'
 {
@@ -724,6 +724,113 @@ test_nb_replace() {
     lab_py notebook show -n "$INTEG_WORK_DIR/hello.ipynb" 0 2>&1 | grep -q "x = 999"
 }
 run_test "notebook replace rewrites cell" test_nb_replace
+
+# ── Native server path (REST + kernel websocket) ──────────────────────────
+
+SRV_URL="http://127.0.0.1:$PORT"
+
+test_native_ps() {
+    lab_py kernel ps --server "$SRV_URL" --token "$TOKEN" 2>&1 | grep -q "hello.ipynb"
+}
+run_test "native: kernel ps --server lists served session" test_native_ps
+
+test_native_exec() {
+    lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
+        -n hello.ipynb "print('native_hi')" 2>&1 | grep -q "native_hi"
+}
+run_test "native: kernel exec over websocket" test_native_exec
+
+test_native_state_cross_transport() {
+    # State set through the server websocket must be visible over ZMQ:
+    # both transports drive the same kernel.
+    lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
+        -n hello.ipynb "native_var = 777" >/dev/null 2>&1
+    lab_py kernel exec --local -n hello.ipynb "print(native_var)" 2>&1 | grep -q "777"
+}
+run_test "native: state persists across websocket and ZMQ transports" \
+    test_native_state_cross_transport
+
+test_native_error_exit() {
+    ! lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
+        -n hello.ipynb "1/0" 2>/dev/null
+}
+run_test "native: exec error returns non-zero" test_native_error_exit
+
+test_native_error_traceback() {
+    local err
+    err="$(lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
+        -n hello.ipynb "1/0" 2>&1 || true)"
+    echo "$err" | grep -q "ZeroDivisionError"
+}
+run_test "native: exec error includes traceback" test_native_error_traceback
+
+test_native_inspect() {
+    lab_py kernel inspect --server "$SRV_URL" --token "$TOKEN" \
+        -n hello.ipynb 2>&1 | grep -q "native_var"
+}
+run_test "native: kernel inspect over websocket" test_native_inspect
+
+test_native_bad_token() {
+    ! lab_py kernel ps --server "$SRV_URL" --token "wrong-token" 2>/dev/null
+}
+run_test "native: wrong token is rejected" test_native_bad_token
+
+test_native_env_server() {
+    LABSH_SERVER="$SRV_URL" LABSH_TOKEN="$TOKEN" \
+        lab_py kernel exec -n hello.ipynb "print('env_native')" 2>&1 | grep -q "env_native"
+}
+run_test "native: LABSH_SERVER/LABSH_TOKEN env vars" test_native_env_server
+
+test_native_token_in_url() {
+    lab_py kernel ps --server "$SRV_URL/?token=$TOKEN" 2>&1 | grep -q "hello.ipynb"
+}
+run_test "native: token embedded in --server URL" test_native_token_in_url
+
+test_local_flag_forces_zmq() {
+    lab_py kernel exec --local -n hello.ipynb "print('zmq_path')" 2>&1 | grep -q "zmq_path"
+}
+run_test "fallback: --local forces connection-file/ZMQ path" test_local_flag_forces_zmq
+
+test_server_local_conflict() {
+    ! lab_py kernel exec --server "$SRV_URL" --local -n hello.ipynb "1" 2>/dev/null
+}
+run_test "native: --server with --local is refused" test_server_local_conflict
+
+test_nb_append_execute_native() {
+    lab_py notebook append --execute --server "$SRV_URL" --token "$TOKEN" \
+        -n hello.ipynb "print('native_append')" 2>&1
+    python3 -c "
+import json, sys
+nb = json.load(open('$INTEG_WORK_DIR/hello.ipynb'))
+last = nb['cells'][-1]
+print(json.dumps(last.get('outputs', [])))
+" | grep -q "native_append"
+}
+run_test "native: notebook append --execute persists output" test_nb_append_execute_native
+
+test_kernel_interrupt() {
+    lab_py kernel interrupt -n hello.ipynb 2>&1 | grep -q "interrupted"
+}
+run_test "native: kernel interrupt succeeds" test_kernel_interrupt
+
+# Keep restart LAST among kernel tests — it clears kernel state.
+test_kernel_restart_clears_state() {
+    lab_py kernel exec -n hello.ipynb "pre_restart_var = 1" >/dev/null 2>&1
+    lab_py kernel restart -n hello.ipynb >/dev/null 2>&1 || return 1
+    # Wait for the restarted kernel to answer, then check state is gone.
+    local _i
+    for _i in $(seq 1 20); do
+        if lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
+                -n hello.ipynb "print('back')" 2>/dev/null | grep -q "back"; then
+            ! lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
+                -n hello.ipynb "print(pre_restart_var)" 2>/dev/null
+            return $?
+        fi
+        sleep 1
+    done
+    return 1
+}
+run_test "native: kernel restart clears state" test_kernel_restart_clears_state
 
 # ── Summary ────────────────────────────────────────────────────────────────
 
