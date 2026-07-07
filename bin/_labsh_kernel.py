@@ -376,7 +376,16 @@ class ServerClient:
 
     # -- REST ---------------------------------------------------------------
 
-    def request(self, method: str, api_path: str, body: dict | None = None) -> Any:
+    def request(
+        self,
+        method: str,
+        api_path: str,
+        body: dict | None = None,
+        timeout: float = 30.0,
+    ) -> Any:
+        # Always bound the request: a half-dead server that accepts the TCP
+        # connection but never answers must surface as unreachable (the stop
+        # guardrail and discovery both rely on that), not hang forever.
         url = f"{self.server.api_base}/{api_path}"
         headers = {"Content-Type": "application/json"}
         if self.server.token:
@@ -384,28 +393,32 @@ class ServerClient:
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(req, context=self._ssl_ctx) as r:
+            with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=timeout) as r:
                 raw = r.read()
         except urllib.error.HTTPError as e:
             raise RuntimeError(
                 f"labsh: server {method} /{api_path} failed: "
                 f"HTTP {e.code} {e.read().decode(errors='replace')}"
             ) from e
-        except urllib.error.URLError as e:
+        except (urllib.error.URLError, OSError) as e:
+            # URLError for connect failures; bare socket timeouts and resets
+            # from read() arrive as raw OSError subclasses.
             raise RuntimeError(
                 f"labsh: cannot reach jupyter server at {self.server.url}: {e}"
             ) from e
         return json.loads(raw) if raw else {}
 
-    def sessions(self) -> list[dict]:
-        result = self.request("GET", "api/sessions")
+    def sessions(self, timeout: float = 30.0) -> list[dict]:
+        result = self.request("GET", "api/sessions", timeout=timeout)
         return result if isinstance(result, list) else []
 
-    def kernels(self) -> list[dict]:
-        result = self.request("GET", "api/kernels")
+    def kernels(self, timeout: float = 30.0) -> list[dict]:
+        result = self.request("GET", "api/kernels", timeout=timeout)
         return result if isinstance(result, list) else []
 
     def create_session(self, path: str, name: str, kernel_name: str) -> dict:
+        # Kernel launch can legitimately take a while (cold venv on NFS) —
+        # bound it generously rather than at the default REST timeout.
         return self.request(
             "POST",
             "api/sessions",
@@ -415,6 +428,7 @@ class ServerClient:
                 "path": path,
                 "type": "notebook",
             },
+            timeout=120.0,
         )
 
     def delete_session(self, session_id: str) -> None:
@@ -426,7 +440,13 @@ class ServerClient:
         )
 
     def restart_kernel(self, kernel_id: str) -> None:
-        self.request("POST", f"api/kernels/{urllib.parse.quote(kernel_id)}/restart")
+        # Waits on the replacement kernel coming up — same slow-launch
+        # allowance as create_session.
+        self.request(
+            "POST",
+            f"api/kernels/{urllib.parse.quote(kernel_id)}/restart",
+            timeout=120.0,
+        )
 
     # -- kernel websocket -----------------------------------------------------
 
@@ -1793,8 +1813,11 @@ def _live_kernel_rows(server: LabServer) -> list[dict[str, str]] | None:
     """
     try:
         client = ServerClient(server)
-        kernels = client.kernels()
-        sessions = client.sessions()
+        # Short timeout: a healthy server answers these GETs in milliseconds.
+        # If it can't answer within 5s it is wedged, and the whole point of
+        # the None return is that a wedged server must stay stoppable fast.
+        kernels = client.kernels(timeout=5.0)
+        sessions = client.sessions(timeout=5.0)
     except RuntimeError:
         return None
     nb_by_kid: dict[str, str] = {}
