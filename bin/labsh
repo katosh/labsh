@@ -221,12 +221,22 @@ AI EXTENSION (notebook-intelligence)
 
   `--no-ai` overrides `LABSH_AI=1` from the CLI.
 
+EXTRA SERVER-ENV PACKAGES (LABSH_WITH)
+  The server env ships `pip` so JupyterLab's in-UI Extension Manager (which
+  shells out to pip) works out of the box. To bake in additional
+  labextensions or their backends, set LABSH_WITH to a whitespace-separated
+  list of packages — each is appended as a `--with` to the server build:
+
+    LABSH_WITH="jupyterlab-code-formatter black isort" labsh start
+
 ENVIRONMENT VARIABLES
   PORT, IP                     Defaults for --port / --ip
   JUPYTER_CERTFILE/KEYFILE     TLS cert / key (enables HTTPS if both set)
   JUPYTER_CONFIG_DIR           default: ./.jupyter
   JUPYTER_DATA_DIR             default: ./.jupyter/share/jupyter
   LABSH_AI                     1/true → enable notebook-intelligence
+  LABSH_WITH                   extra server-env packages (space-separated,
+                               appended as --with to the jupyter-lab build)
   LABSH_SERVER                 Default --server URL for runtime kernel cmds
   LABSH_TOKEN                  Default --token for LABSH_SERVER
   UV_CACHE_DIR                 default: /tmp/uv-cache-$UID
@@ -915,9 +925,20 @@ parse_server_flags() {
         --with jupyterlab_execute_time
         --with jupyter-resource-usage
         --with jupyterlab-widgets
+        --with pip
     )
     if [ "$WITH_AI" -eq 1 ]; then
         WITH_ARGS+=(--with notebook-intelligence)
+    fi
+    # Extra server-env packages via LABSH_WITH (whitespace-separated list),
+    # appended as --with args. This is the general seam for adding
+    # labextensions or their backends (e.g. jupyterlab-code-formatter + black)
+    # without forking the baseline above. Mirrors the LABSH_AI env toggle.
+    if [ -n "${LABSH_WITH:-}" ]; then
+        # shellcheck disable=SC2086 — deliberate word-split of the package list
+        for _lw_pkg in $LABSH_WITH; do
+            WITH_ARGS+=(--with "$_lw_pkg")
+        done
     fi
 
     if [ "$USE_HTTPS" -eq 1 ]; then
