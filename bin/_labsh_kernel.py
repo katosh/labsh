@@ -362,6 +362,15 @@ def server_for_path(servers: list[LabServer], path: Path) -> LabServer | None:
 # ---------------------------------------------------------------------------
 
 
+class ExecutionStartedError(RuntimeError):
+    """Websocket execution failed AFTER the execute_request was sent.
+
+    The code may be running (or may already have run) in the kernel, so
+    callers must surface the failure rather than retry over another
+    transport — an automatic ZMQ re-run would execute side-effecting code
+    twice."""
+
+
 class ServerClient:
     """Client for a running Jupyter server's REST API and kernel websockets."""
 
@@ -573,43 +582,57 @@ class ServerClient:
             per_msg_timeout = 5.0 if timeout is None else min(5.0, timeout)
             deadline = None if timeout is None else time.monotonic() + timeout
             ws.settimeout(per_msg_timeout)
-            ws.send(json.dumps(req))
 
-            collector = OutputCollector(capture)
-            reply_count: int | None = None
-            reply_seen = False
-            idle_grace: float | None = None  # reply straggler allowance
+            # From the send onward the request may have reached the kernel,
+            # so any failure below must NOT be retried over another
+            # transport (side-effecting code would run twice) — mark it.
+            try:
+                ws.send(json.dumps(req))
 
-            while not (collector.idle and reply_seen):
-                now = time.monotonic()
-                if deadline is not None and now > deadline:
-                    return (
-                        124,
-                        "".join(collector.stdout_parts),
-                        "".join(collector.stderr_parts),
-                        collector.outputs,
-                        collector.execution_count,
-                    )
-                if collector.idle:
-                    if idle_grace is None:
-                        idle_grace = now + 5.0
-                    elif now > idle_grace:
-                        break
-                msg = self._recv_msg(ws)
-                if msg is None:
-                    continue
-                if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
-                    continue
-                channel = msg.get("channel")
-                if channel == "iopub":
-                    collector.handle_iopub(
-                        msg.get("msg_type", ""), msg.get("content") or {}
-                    )
-                elif channel == "shell" and msg.get("msg_type") == "execute_reply":
-                    reply_seen = True
-                    ec = (msg.get("content") or {}).get("execution_count")
-                    if ec is not None:
-                        reply_count = ec
+                collector = OutputCollector(capture)
+                reply_count: int | None = None
+                reply_seen = False
+                idle_grace: float | None = None  # reply straggler allowance
+
+                while not (collector.idle and reply_seen):
+                    now = time.monotonic()
+                    if deadline is not None and now > deadline:
+                        return (
+                            124,
+                            "".join(collector.stdout_parts),
+                            "".join(collector.stderr_parts),
+                            collector.outputs,
+                            collector.execution_count,
+                        )
+                    if collector.idle:
+                        if idle_grace is None:
+                            idle_grace = now + 5.0
+                        elif now > idle_grace:
+                            break
+                    msg = self._recv_msg(ws)
+                    if msg is None:
+                        continue
+                    if (msg.get("parent_header") or {}).get("msg_id") != msg_id:
+                        continue
+                    channel = msg.get("channel")
+                    if channel == "iopub":
+                        collector.handle_iopub(
+                            msg.get("msg_type", ""), msg.get("content") or {}
+                        )
+                    elif channel == "shell" and msg.get("msg_type") == "execute_reply":
+                        reply_seen = True
+                        ec = (msg.get("content") or {}).get("execution_count")
+                        if ec is not None:
+                            reply_count = ec
+            except ExecutionStartedError:
+                raise
+            except Exception as e:
+                # Includes websocket-lib exceptions from send(); whatever the
+                # type, the only safe report past this point is "may have run".
+                raise ExecutionStartedError(
+                    f"{e} — the request had already been sent, so the code may "
+                    "have executed; NOT retrying over ZMQ"
+                ) from e
 
             execution_count = (
                 collector.execution_count
@@ -1186,10 +1209,15 @@ def execute(
                 capture=capture,
                 short_id=kernel.short_id,
             )
+        except ExecutionStartedError:
+            # The execute_request already reached (or may have reached) the
+            # kernel — re-running over ZMQ would execute side-effecting code
+            # twice. Surface the failure instead.
+            raise
         except RuntimeError as e:
-            # A merged kernel still has its connection file — fall back to
-            # ZMQ rather than failing outright when the server-side path
-            # breaks mid-flight (e.g. websocket handshake refused).
+            # Pre-send failures only (websocket connect/handshake, dead-kernel
+            # preflight): nothing has executed, so a merged kernel that still
+            # has a connection file can safely retry over ZMQ.
             if kernel.connection_file is None:
                 raise
             eprint(f"{e}")
@@ -1298,7 +1326,10 @@ def cmd_kernel_exec(args: argparse.Namespace) -> int:
         required_action="kernel exec",
     )
     code = _read_code(args)
-    exit_code, *_ = execute(kernel, code, timeout=args.timeout, capture=False)
+    try:
+        exit_code, *_ = execute(kernel, code, timeout=args.timeout, capture=False)
+    except RuntimeError as e:
+        _die(str(e))
     return exit_code
 
 
@@ -1338,7 +1369,10 @@ def cmd_kernel_inspect(args: argparse.Namespace) -> int:
         "        sys.stdout.write('  '.join(r[i].ljust(w[i]) for i in range(4)) + '\\n')\n"
         f"__lab_inspect({pattern!r})\n"
     )
-    exit_code, *_ = execute(kernel, code, timeout=args.timeout, capture=False)
+    try:
+        exit_code, *_ = execute(kernel, code, timeout=args.timeout, capture=False)
+    except RuntimeError as e:
+        _die(str(e))
     return exit_code
 
 
@@ -1643,9 +1677,12 @@ def cmd_notebook_append(args: argparse.Namespace) -> int:
             kernel_sel=None,
             required_action="notebook append --execute",
         )
-        exit_code, _stdout, _stderr, outputs, execution_count = execute(
-            kernel, content, timeout=args.timeout, capture=True
-        )
+        try:
+            exit_code, _stdout, _stderr, outputs, execution_count = execute(
+                kernel, content, timeout=args.timeout, capture=True
+            )
+        except RuntimeError as e:
+            _die(str(e))
     cells.append(
         _make_code_cell(content, outputs=outputs, execution_count=execution_count)
     )
@@ -1679,9 +1716,12 @@ def cmd_notebook_replace(args: argparse.Namespace) -> int:
             kernel_sel=None,
             required_action="notebook replace --execute",
         )
-        exit_code, _stdout, _stderr, outputs, execution_count = execute(
-            kernel, content, timeout=args.timeout, capture=True
-        )
+        try:
+            exit_code, _stdout, _stderr, outputs, execution_count = execute(
+                kernel, content, timeout=args.timeout, capture=True
+            )
+        except RuntimeError as e:
+            _die(str(e))
     if ct == "code":
         cells[args.index] = _make_code_cell(
             content,

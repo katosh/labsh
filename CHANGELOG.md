@@ -117,6 +117,16 @@ fixed.
 - The labsh helper venv now also carries `websocket-client` (pure
   Python, zero transitive deps — the one new dependency backing the
   websocket transport; `jupyter_client` offers no websocket client).
+- Every REST call to the server is now bounded by a timeout (default
+  30 s; 5 s for the stop guardrail's kernel probes; 120 s for
+  kernel-launching calls) — a half-dead server that accepts the TCP
+  connection but never answers can no longer hang labsh commands
+  forever.
+- The websocket→ZMQ execution fallback only triggers for failures
+  *before* the execute request is sent (connect, handshake, dead-kernel
+  preflight). A mid-flight failure after the code may have reached the
+  kernel now surfaces as an error instead of silently re-running the
+  cell over ZMQ — side-effecting code can no longer execute twice.
 
 ## [0.4.1] - 2026-05-07
 
