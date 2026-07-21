@@ -524,6 +524,80 @@ test_with_args_persisted_extensions() {
 run_test "server env: persisted ext specs included, comments skipped" \
     test_with_args_persisted_extensions
 
+# --- start-guard: phantom-adopt / PID-reuse safety ---
+# Source the guard functions from bin/labsh so we can exercise them directly
+# against synthetic jpserver-*.json records. PROG is referenced on the
+# "server running" branch, so define it.
+# shellcheck disable=SC1090
+source <(sed -n '/^pid_is_jupyter() {$/,/^}$/p' "$LAB")
+# shellcheck disable=SC1090
+source <(sed -n '/^check_existing_server() {$/,/^}$/p' "$LAB")
+PROG="labsh"
+
+# Write a synthetic runtime record naming a given pid.
+make_jpserver() {
+    local rt="$1" pid="$2"
+    mkdir -p "$rt"
+    cat > "$rt/jpserver-$pid.json" <<JSON
+{"pid": $pid, "url": "http://127.0.0.1:8888/", "token": "x"}
+JSON
+}
+
+test_pid_is_jupyter_rejects_dead_and_empty() {
+    ! pid_is_jupyter "" || return 1
+    sleep 30 & local dead=$!
+    kill "$dead" 2>/dev/null; wait "$dead" 2>/dev/null || true
+    ! pid_is_jupyter "$dead"
+}
+run_test "pid_is_jupyter: empty and dead pids are not a server" \
+    test_pid_is_jupyter_rejects_dead_and_empty
+
+test_guard_drops_dead_pid_record() {
+    # A crash leaves a jpserver-*.json whose pid is now dead. The guard must
+    # report "no server" AND remove the stale record so it self-heals.
+    local data="$UNIT_WORK_DIR/guard-dead"; local rt="$data/runtime"
+    rm -rf "$data"; mkdir -p "$rt"
+    sleep 30 & local dead=$!
+    kill "$dead" 2>/dev/null; wait "$dead" 2>/dev/null || true
+    make_jpserver "$rt" "$dead"
+    local rc=0
+    JUPYTER_DATA_DIR="$data" check_existing_server >/dev/null 2>&1 || rc=$?
+    [ "$rc" -ne 0 ] && [ ! -e "$rt/jpserver-$dead.json" ]
+}
+run_test "start-guard: dead-pid record is ignored and removed" \
+    test_guard_drops_dead_pid_record
+
+test_guard_drops_recycled_nonjupyter_pid() {
+    # After a reboot the recorded pid can be recycled to an unrelated LIVE
+    # process (here a plain `sleep`). A bare `kill -0` would misread it as the
+    # server (the phantom-adopt bug); the cmdline check must reject it.
+    local data="$UNIT_WORK_DIR/guard-recycled"; local rt="$data/runtime"
+    rm -rf "$data"; mkdir -p "$rt"
+    sleep 30 & local other=$!
+    make_jpserver "$rt" "$other"
+    local rc=0
+    JUPYTER_DATA_DIR="$data" check_existing_server >/dev/null 2>&1 || rc=$?
+    kill "$other" 2>/dev/null; wait "$other" 2>/dev/null || true
+    [ "$rc" -ne 0 ] && [ ! -e "$rt/jpserver-$other.json" ]
+}
+run_test "start-guard: recycled non-jupyter pid is not adopted" \
+    test_guard_drops_recycled_nonjupyter_pid
+
+test_guard_detects_live_jupyter() {
+    # A genuinely-live jupyter process (argv contains "jupyter") must still be
+    # detected as running, and its record left intact.
+    local data="$UNIT_WORK_DIR/guard-live"; local rt="$data/runtime"
+    rm -rf "$data"; mkdir -p "$rt"
+    bash -c 'exec -a jupyter-lab-fake sleep 30' & local srv=$!
+    make_jpserver "$rt" "$srv"
+    local rc=0
+    JUPYTER_DATA_DIR="$data" check_existing_server >/dev/null 2>&1 || rc=$?
+    kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null || true
+    [ "$rc" -eq 0 ] && [ -e "$rt/jpserver-$srv.json" ]
+}
+run_test "start-guard: live jupyter server is detected, record kept" \
+    test_guard_detects_live_jupyter
+
 echo
 echo "test-labsh: unit tests done — $pass/$total passed"
 echo

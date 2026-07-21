@@ -492,9 +492,34 @@ run_helper_fast() {
     exec "$LAB_VENV_DIR/bin/python" "$HELPER_PY" "$@"
 }
 
+# True if $1 is a LIVE process whose argv looks like a Jupyter server.
+#
+# A bare `kill -0` is not enough to trust a recorded jpserver-*.json pid: an
+# unclean shutdown (crash / abrupt node reboot) leaves the json behind, and by
+# the next `labsh start` the OS may have recycled that pid to an unrelated
+# process, or the pid may linger as a zombie — in both cases `kill -0`
+# succeeds while nothing serves. Reading the pid's argv and requiring
+# "jupyter" in it rejects both (a zombie has an empty cmdline; a recycled pid
+# belongs to something else). This mirrors the Python helper's cmdline sanity
+# check in _server_from_runtime_file (_labsh_kernel.py) so the bash start-guard
+# and `labsh status` agree instead of disagreeing on the same stale record.
+pid_is_jupyter() {
+    local pid="$1" cmdline
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" || return 1
+    case "$cmdline" in
+        *jupyter*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Check for an already-running labsh server by scanning jpserver-*.json files
 # in the runtime directory. Returns 0 (true) if a live server is found and
-# prints its URL to stderr; returns 1 (false) otherwise.
+# prints its URL to stderr; returns 1 (false) otherwise. Stale records (pid
+# dead, a zombie, or recycled to a non-jupyter process) are removed as they
+# are encountered, so the guard self-heals instead of refusing to start
+# forever after an unclean shutdown (the "phantom-adopt" failure).
 check_existing_server() {
     local runtime_dir="$JUPYTER_DATA_DIR/runtime"
     [ -d "$runtime_dir" ] || return 1
@@ -503,12 +528,15 @@ check_existing_server() {
         [ -e "$jf" ] || continue
         pid="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('pid',''))" "$jf" 2>/dev/null)" || continue
         [ -n "$pid" ] || continue
-        if kill -0 "$pid" 2>/dev/null; then
+        if pid_is_jupyter "$pid"; then
             url="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('url',''))" "$jf" 2>/dev/null)" || url="(unknown)"
             echo "$PROG: server is already running (pid $pid, $url)" >&2
             echo "$PROG: use 'labsh status' to see details, or 'labsh stop' to shut it down." >&2
             return 0
         fi
+        # Stale record — the recorded server is gone. Drop the file so it stops
+        # tripping the guard (and cluttering `status`/`url`) on every retry.
+        rm -f "$jf" 2>/dev/null || true
     done
     return 1
 }
@@ -791,7 +819,9 @@ find_server_pid() {
         [ -e "$jf" ] || continue
         pid="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('pid',''))" "$jf" 2>/dev/null)" || continue
         [ -n "$pid" ] || continue
-        if kill -0 "$pid" 2>/dev/null; then
+        # Same PID-reuse / zombie guard as check_existing_server: a bare
+        # `kill -0` would hand back a recycled pid that no longer serves.
+        if pid_is_jupyter "$pid"; then
             echo "$pid"
             return 0
         fi
@@ -1284,7 +1314,7 @@ cmd_url() {
         [ -e "$jf" ] || continue
         pid="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('pid',''))" "$jf" 2>/dev/null)" || continue
         [ -n "$pid" ] || continue
-        if kill -0 "$pid" 2>/dev/null; then
+        if pid_is_jupyter "$pid"; then
             url="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('url',''))" "$jf" 2>/dev/null)" || url=""
             token="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('token',''))" "$jf" 2>/dev/null)" || token=""
             if [ -n "$url" ]; then
