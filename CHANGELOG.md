@@ -1,5 +1,44 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed — start-guard no longer "phantom-adopts" a stale server record
+
+The `labsh start` guard decided a server was already running from a
+`jpserver-*.json` record using only `kill -0 <pid>`. After an unclean
+shutdown (crash / abrupt node reboot) the recorded pid may be dead, a
+zombie, or **recycled by the OS to an unrelated live process** — in the
+last two cases `kill -0` succeeds while nothing serves, so `start`
+refused indefinitely even though no server answered (a multi-minute
+outage that never self-healed, since a supervisor re-adopts the same
+dead record on every retry). `labsh status` never showed this server
+because the Python helper already verifies the pid is a jupyter process.
+
+- New `pid_is_jupyter` helper reads `/proc/<pid>/cmdline` and requires
+  `jupyter` in the argv, mirroring the Python helper's sanity check
+  (`_server_from_runtime_file`) so the bash start-guard and `labsh
+  status` agree on the same record.
+- `check_existing_server`, `find_server_pid`, and `cmd_url` now use it
+  instead of a bare `kill -0`.
+- `check_existing_server` removes a stale record as it encounters it, so
+  the guard self-heals instead of tripping on the same file every retry.
+- Regression tests: dead pid → ignored + record removed; live
+  non-jupyter (recycled) pid → not adopted + record removed; live
+  jupyter server → still detected, record kept.
+
+### Fixed — CI hygiene: shellcheck clean and a de-flaked stop test
+
+- `shellcheck bin/labsh test-labsh.sh` is green again (it had been red
+  since v0.5.0). Fixed a malformed `disable=` directive (SC1125), empty
+  env assignments written `VAR=` → `VAR=''` (SC1007), an unused loop
+  variable `i` → `_i` (SC2034), a `PROG` cross-source use shellcheck
+  can't see (annotated SC2034), and a `! cmd; return $?` reshaped into
+  an explicit `if` (SC2251). No behaviour change.
+- `stop: --force stops the server` waited only 20 s for the server to
+  exit after SIGTERM. jupyter's graceful teardown (shut down every
+  kernel, then exit) can exceed that on a loaded CI runner, flaking the
+  test red while `stop` itself succeeded. Widened the death-wait to 60 s.
+
 ## [0.5.0] - 2026-07-06
 
 ### Added — kernel resilience: stop guardrail + hot extension installs

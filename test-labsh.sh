@@ -497,7 +497,7 @@ with_args_contain() {
 }
 
 test_with_args_ship_pip() {
-    EXT_FILE="/nonexistent" LABSH_WITH= IP=127.0.0.1 parse_server_flags
+    EXT_FILE="/nonexistent" LABSH_WITH='' IP=127.0.0.1 parse_server_flags
     with_args_contain pip
 }
 run_test "server env: baseline --with list ships pip" test_with_args_ship_pip
@@ -515,7 +515,7 @@ test_with_args_persisted_extensions() {
     mkdir -p "$d"
     printf 'jupyterlab-vim\n# a comment\n\njupyterlab-git==0.50.0\n' \
         > "$d/labsh-extensions"
-    EXT_FILE="$d/labsh-extensions" LABSH_WITH= IP=127.0.0.1 \
+    EXT_FILE="$d/labsh-extensions" LABSH_WITH='' IP=127.0.0.1 \
         parse_server_flags
     with_args_contain jupyterlab-vim \
         && with_args_contain "jupyterlab-git==0.50.0" \
@@ -523,6 +523,83 @@ test_with_args_persisted_extensions() {
 }
 run_test "server env: persisted ext specs included, comments skipped" \
     test_with_args_persisted_extensions
+
+# --- start-guard: phantom-adopt / PID-reuse safety ---
+# Source the guard functions from bin/labsh so we can exercise them directly
+# against synthetic jpserver-*.json records. PROG is referenced on the
+# "server running" branch, so define it.
+# shellcheck disable=SC1090
+source <(sed -n '/^pid_is_jupyter() {$/,/^}$/p' "$LAB")
+# shellcheck disable=SC1090
+source <(sed -n '/^check_existing_server() {$/,/^}$/p' "$LAB")
+# PROG is read by the sourced check_existing_server on its "server running"
+# branch; shellcheck can't see that cross-source use.
+# shellcheck disable=SC2034
+PROG="labsh"
+
+# Write a synthetic runtime record naming a given pid.
+make_jpserver() {
+    local rt="$1" pid="$2"
+    mkdir -p "$rt"
+    cat > "$rt/jpserver-$pid.json" <<JSON
+{"pid": $pid, "url": "http://127.0.0.1:8888/", "token": "x"}
+JSON
+}
+
+test_pid_is_jupyter_rejects_dead_and_empty() {
+    ! pid_is_jupyter "" || return 1
+    sleep 30 & local dead=$!
+    kill "$dead" 2>/dev/null; wait "$dead" 2>/dev/null || true
+    ! pid_is_jupyter "$dead"
+}
+run_test "pid_is_jupyter: empty and dead pids are not a server" \
+    test_pid_is_jupyter_rejects_dead_and_empty
+
+test_guard_drops_dead_pid_record() {
+    # A crash leaves a jpserver-*.json whose pid is now dead. The guard must
+    # report "no server" AND remove the stale record so it self-heals.
+    local data="$UNIT_WORK_DIR/guard-dead"; local rt="$data/runtime"
+    rm -rf "$data"; mkdir -p "$rt"
+    sleep 30 & local dead=$!
+    kill "$dead" 2>/dev/null; wait "$dead" 2>/dev/null || true
+    make_jpserver "$rt" "$dead"
+    local rc=0
+    JUPYTER_DATA_DIR="$data" check_existing_server >/dev/null 2>&1 || rc=$?
+    [ "$rc" -ne 0 ] && [ ! -e "$rt/jpserver-$dead.json" ]
+}
+run_test "start-guard: dead-pid record is ignored and removed" \
+    test_guard_drops_dead_pid_record
+
+test_guard_drops_recycled_nonjupyter_pid() {
+    # After a reboot the recorded pid can be recycled to an unrelated LIVE
+    # process (here a plain `sleep`). A bare `kill -0` would misread it as the
+    # server (the phantom-adopt bug); the cmdline check must reject it.
+    local data="$UNIT_WORK_DIR/guard-recycled"; local rt="$data/runtime"
+    rm -rf "$data"; mkdir -p "$rt"
+    sleep 30 & local other=$!
+    make_jpserver "$rt" "$other"
+    local rc=0
+    JUPYTER_DATA_DIR="$data" check_existing_server >/dev/null 2>&1 || rc=$?
+    kill "$other" 2>/dev/null; wait "$other" 2>/dev/null || true
+    [ "$rc" -ne 0 ] && [ ! -e "$rt/jpserver-$other.json" ]
+}
+run_test "start-guard: recycled non-jupyter pid is not adopted" \
+    test_guard_drops_recycled_nonjupyter_pid
+
+test_guard_detects_live_jupyter() {
+    # A genuinely-live jupyter process (argv contains "jupyter") must still be
+    # detected as running, and its record left intact.
+    local data="$UNIT_WORK_DIR/guard-live"; local rt="$data/runtime"
+    rm -rf "$data"; mkdir -p "$rt"
+    bash -c 'exec -a jupyter-lab-fake sleep 30' & local srv=$!
+    make_jpserver "$rt" "$srv"
+    local rc=0
+    JUPYTER_DATA_DIR="$data" check_existing_server >/dev/null 2>&1 || rc=$?
+    kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null || true
+    [ "$rc" -eq 0 ] && [ -e "$rt/jpserver-$srv.json" ]
+}
+run_test "start-guard: live jupyter server is detected, record kept" \
+    test_guard_detects_live_jupyter
 
 echo
 echo "test-labsh: unit tests done — $pass/$total passed"
@@ -912,8 +989,8 @@ run_test "native: kernel interrupt succeeds" test_kernel_interrupt
 
 test_client_ops_leave_server_alive() {
     lab_py kernel exec -n hello.ipynb "survivor = 12345" >/dev/null 2>&1
-    local i
-    for i in 1 2 3; do
+    local _i
+    for _i in 1 2 3; do
         lab_py kernel ps >/dev/null 2>&1
         lab_py kernel find hello.ipynb >/dev/null 2>&1
         lab_py status >/dev/null 2>&1
@@ -977,9 +1054,13 @@ test_kernel_restart_clears_state() {
     for _i in $(seq 1 20); do
         if lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
                 -n hello.ipynb "print('back')" 2>/dev/null | grep -q "back"; then
-            ! lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
-                -n hello.ipynb "print(pre_restart_var)" 2>/dev/null
-            return $?
+            # State must be gone: the pre-restart var no longer resolves, so the
+            # exec fails. Success here means the restart did NOT clear state.
+            if lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
+                    -n hello.ipynb "print(pre_restart_var)" 2>/dev/null; then
+                return 1
+            fi
+            return 0
         fi
         sleep 1
     done
@@ -1018,8 +1099,13 @@ run_test "stop: refuses with live kernels (exit 3), server survives" \
 
 test_stop_force_stops_server() {
     lab_py stop --force >/dev/null 2>&1 || return 1
+    # stop sends SIGTERM; jupyter_server then shuts down every kernel gracefully
+    # (cleanup_kernels → shutdown_all) before the process exits. That teardown
+    # can run well past 20 s on a loaded CI runner — a too-tight ceiling here
+    # flaked this test red while `stop` itself succeeded. Wait generously; the
+    # SIGTERM already fired, so we are only timing the graceful exit.
     local _i
-    for _i in $(seq 1 20); do
+    for _i in $(seq 1 60); do
         kill -0 "$SERVER_PID" 2>/dev/null || return 0
         sleep 1
     done
