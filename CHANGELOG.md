@@ -26,6 +26,19 @@ because the Python helper already verifies the pid is a jupyter process.
   non-jupyter (recycled) pid → not adopted + record removed; live
   jupyter server → still detected, record kept.
 
+### Fixed — CI hygiene: shellcheck clean and a de-flaked stop test
+
+- `shellcheck bin/labsh test-labsh.sh` is green again (it had been red
+  since v0.5.0). Fixed a malformed `disable=` directive (SC1125), empty
+  env assignments written `VAR=` → `VAR=''` (SC1007), an unused loop
+  variable `i` → `_i` (SC2034), a `PROG` cross-source use shellcheck
+  can't see (annotated SC2034), and a `! cmd; return $?` reshaped into
+  an explicit `if` (SC2251). No behaviour change.
+- `stop: --force stops the server` waited only 20 s for the server to
+  exit after SIGTERM. jupyter's graceful teardown (shut down every
+  kernel, then exit) can exceed that on a loaded CI runner, flaking the
+  test red while `stop` itself succeeded. Widened the death-wait to 60 s.
+
 ## [0.5.0] - 2026-07-06
 
 ### Added — kernel resilience: stop guardrail + hot extension installs

@@ -1132,7 +1132,8 @@ parse_server_flags() {
     # labextensions or their backends (e.g. jupyterlab-code-formatter + black)
     # without forking the baseline above. Mirrors the LABSH_AI env toggle.
     if [ -n "${LABSH_WITH:-}" ]; then
-        # shellcheck disable=SC2086 — deliberate word-split of the package list
+        # Deliberate word-split of the whitespace-separated package list.
+        # shellcheck disable=SC2086
         for _lw_pkg in $LABSH_WITH; do
             WITH_ARGS+=(--with "$_lw_pkg")
         done

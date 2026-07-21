@@ -497,7 +497,7 @@ with_args_contain() {
 }
 
 test_with_args_ship_pip() {
-    EXT_FILE="/nonexistent" LABSH_WITH= IP=127.0.0.1 parse_server_flags
+    EXT_FILE="/nonexistent" LABSH_WITH='' IP=127.0.0.1 parse_server_flags
     with_args_contain pip
 }
 run_test "server env: baseline --with list ships pip" test_with_args_ship_pip
@@ -515,7 +515,7 @@ test_with_args_persisted_extensions() {
     mkdir -p "$d"
     printf 'jupyterlab-vim\n# a comment\n\njupyterlab-git==0.50.0\n' \
         > "$d/labsh-extensions"
-    EXT_FILE="$d/labsh-extensions" LABSH_WITH= IP=127.0.0.1 \
+    EXT_FILE="$d/labsh-extensions" LABSH_WITH='' IP=127.0.0.1 \
         parse_server_flags
     with_args_contain jupyterlab-vim \
         && with_args_contain "jupyterlab-git==0.50.0" \
@@ -532,6 +532,9 @@ run_test "server env: persisted ext specs included, comments skipped" \
 source <(sed -n '/^pid_is_jupyter() {$/,/^}$/p' "$LAB")
 # shellcheck disable=SC1090
 source <(sed -n '/^check_existing_server() {$/,/^}$/p' "$LAB")
+# PROG is read by the sourced check_existing_server on its "server running"
+# branch; shellcheck can't see that cross-source use.
+# shellcheck disable=SC2034
 PROG="labsh"
 
 # Write a synthetic runtime record naming a given pid.
@@ -986,8 +989,8 @@ run_test "native: kernel interrupt succeeds" test_kernel_interrupt
 
 test_client_ops_leave_server_alive() {
     lab_py kernel exec -n hello.ipynb "survivor = 12345" >/dev/null 2>&1
-    local i
-    for i in 1 2 3; do
+    local _i
+    for _i in 1 2 3; do
         lab_py kernel ps >/dev/null 2>&1
         lab_py kernel find hello.ipynb >/dev/null 2>&1
         lab_py status >/dev/null 2>&1
@@ -1051,9 +1054,13 @@ test_kernel_restart_clears_state() {
     for _i in $(seq 1 20); do
         if lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
                 -n hello.ipynb "print('back')" 2>/dev/null | grep -q "back"; then
-            ! lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
-                -n hello.ipynb "print(pre_restart_var)" 2>/dev/null
-            return $?
+            # State must be gone: the pre-restart var no longer resolves, so the
+            # exec fails. Success here means the restart did NOT clear state.
+            if lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
+                    -n hello.ipynb "print(pre_restart_var)" 2>/dev/null; then
+                return 1
+            fi
+            return 0
         fi
         sleep 1
     done
@@ -1092,8 +1099,13 @@ run_test "stop: refuses with live kernels (exit 3), server survives" \
 
 test_stop_force_stops_server() {
     lab_py stop --force >/dev/null 2>&1 || return 1
+    # stop sends SIGTERM; jupyter_server then shuts down every kernel gracefully
+    # (cleanup_kernels → shutdown_all) before the process exits. That teardown
+    # can run well past 20 s on a loaded CI runner — a too-tight ceiling here
+    # flaked this test red while `stop` itself succeeded. Wait generously; the
+    # SIGTERM already fired, so we are only timing the graceful exit.
     local _i
-    for _i in $(seq 1 20); do
+    for _i in $(seq 1 60); do
         kill -0 "$SERVER_PID" 2>/dev/null || return 0
         sleep 1
     done
