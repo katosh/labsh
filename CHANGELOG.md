@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.5.1] - 2026-10-02
+
+### Fixed — stale server records after a restart
+
+- **A recycled pid no longer blocks `labsh start`.** The runtime dir
+  (`.jupyter/share/jupyter/runtime/`) survives a host reboot or a
+  container / PID-namespace restart; the server does not. Its
+  `jpserver-<pid>.json` stayed behind, and labsh trusted it whenever
+  `kill -0 <pid>` succeeded — which, after a restart, is often an
+  unrelated process that inherited the pid. `labsh start` then reported
+  "server is already running" and exited 1 indefinitely. A record now
+  counts as live only when its pid (1) is running, (2) has a jupyter
+  server argv (`jupyter-lab`, `jupyter-server`, `-m jupyterlab`, …), and
+  (3) started no later than the record was written (60 s slack for
+  network-filesystem clock skew). `start`/`serve` move a stale record
+  aside to `jpserver-<pid>.json.stale` with a warning; `url` and
+  `ext` ignore it.
+- **`labsh stop` can no longer SIGTERM an unrelated process.** The
+  helper's check was a substring test for `jupyter` anywhere in argv,
+  which a kernel (`…/share/jupyter/runtime/kernel-*.json`) or any process
+  under a `.jupyter/` path satisfies. `status` and `stop` now apply the
+  same identity check as the shell side.
+- **Helper venv rebuild survives a damaged lockfile.** After a `/tmp`
+  wipe the helper venv is rebuilt from `.jupyter/.labshvenv.lock`. An
+  empty lockfile was "restored" (installing nothing) and a truncated one
+  restored a partial set, leaving every helper command broken. The
+  rebuild now re-checks the required packages and installs what is still
+  missing, and the lockfile is written via temp file + rename so an
+  interrupted write cannot truncate it.
+
+### Tests
+
+- Planted `jpserver-*.json` records whose pid is a live unrelated
+  process, or a jupyter-named process younger than the record: `start`
+  proceeds (record moved aside), `url` ignores it, `stop` leaves the
+  process alive. Positive control: a jupyter process older than its
+  record still blocks a second start.
+- Helper venv rebuild from an empty and from a truncated lockfile.
+
 ## [0.5.0] - 2026-07-06
 
 ### Added — kernel resilience: stop guardrail + hot extension installs
