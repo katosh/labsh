@@ -39,6 +39,7 @@ import getpass
 import json
 import os
 import queue
+import re
 import signal
 import ssl
 import sys
@@ -207,11 +208,53 @@ class LabServer:
         return self.url.rstrip("/")
 
 
+_SERVER_EXE = re.compile(r"jupyter(-(lab|server|notebook|labhub))?$")
+_SERVER_MODULES = ("jupyterlab", "jupyter_server", "notebook")
+# Slack for clock skew between this host and a network filesystem's mtimes.
+_RECORD_CLOCK_SLACK_S = 60
+
+
+def _is_jupyter_server_argv(cmdline: list[str]) -> bool:
+    if any(_SERVER_EXE.match(os.path.basename(a)) for a in cmdline):
+        return True
+    return any(
+        a == "-m" and i + 1 < len(cmdline) and cmdline[i + 1] in _SERVER_MODULES
+        for i, a in enumerate(cmdline)
+    )
+
+
+def _is_record_author(jf: Path, pid: int) -> bool:
+    """True when `pid` is still the jupyter server that wrote record `jf`.
+
+    Existence is not identity: the runtime dir survives restarts (host
+    reboot, container or PID-namespace restart) while the server does not,
+    so the recorded pid is often held by an unrelated process afterwards. A
+    substring test for "jupyter" is not enough either — kernels carry
+    `.../share/jupyter/runtime/kernel-*.json` in their argv. Require a
+    jupyter server argv AND a process no younger than the record:
+    jupyter_server writes the record after it starts, so a process that
+    started later cannot be its author.
+    """
+    try:
+        proc = psutil.Process(pid)
+        cmdline = proc.cmdline()
+        started = proc.create_time()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
+    if not _is_jupyter_server_argv(cmdline):
+        return False
+    try:
+        written = jf.stat().st_mtime
+    except OSError:
+        return False
+    return started <= written + _RECORD_CLOCK_SLACK_S
+
+
 def _server_from_runtime_file(jf: Path, source: str) -> LabServer | None:
     """Parse one jpserver-<pid>.json, returning a live LabServer or None.
 
-    Only files whose pid is alive in this PID namespace are considered
-    (sandbox-safe: orphaned files from a previous run are ignored).
+    Only files whose pid is still the server that wrote them are considered
+    (see _is_record_author): orphaned files from a previous run are ignored.
     """
     try:
         data = json.loads(jf.read_text())
@@ -220,16 +263,7 @@ def _server_from_runtime_file(jf: Path, source: str) -> LabServer | None:
     pid = data.get("pid")
     if not isinstance(pid, int):
         return None
-    if not psutil.pid_exists(pid):
-        return None
-    try:
-        proc = psutil.Process(pid)
-        cmdline = proc.cmdline()
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        return None
-    # Sanity: ensure this really is a jupyter process. This guards against
-    # PID reuse after the server died without cleaning up its json.
-    if not any("jupyter" in part for part in cmdline):
+    if not _is_record_author(jf, pid):
         return None
     root_raw = data.get("root_dir")
     return LabServer(

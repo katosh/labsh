@@ -524,6 +524,100 @@ test_with_args_persisted_extensions() {
 run_test "server env: persisted ext specs included, comments skipped" \
     test_with_args_persisted_extensions
 
+# --- stale server records (pid reused after a restart) ---
+#
+# A jpserver-<pid>.json outlives its server when the runtime dir survives a
+# restart (host reboot, container / PID-namespace restart). The recorded pid
+# is then often held by an UNRELATED process; existence alone (kill -0) must
+# not make labsh believe a server is running.
+
+# shellcheck disable=SC1090
+source <(sed -n '/^read_server_record() {$/,/^}$/p;/^check_existing_server() {$/,/^}$/p' "$LAB")
+
+STALE_PIDS_FILE="$UNIT_WORK_DIR/stale-pids"
+spawn_unrelated() {  # a live process we own that is NOT a jupyter server
+    sleep 300 >/dev/null 2>&1 &
+    echo "$!" >> "$STALE_PIDS_FILE"; echo "$!"
+}
+spawn_named() {  # a live process whose argv[0] is $1
+    bash -c "exec -a '$1' sleep 300" >/dev/null 2>&1 &
+    echo "$!" >> "$STALE_PIDS_FILE"; echo "$!"
+}
+plant_record() {  # plant_record DIR PID — a jpserver json for PID
+    local rt="$1/.jupyter/share/jupyter/runtime"
+    mkdir -p "$rt"
+    printf '{"pid": %s, "port": 1, "url": "http://127.0.0.1:1/", "token": "t", "root_dir": "%s"}\n' \
+        "$2" "$1" > "$rt/jpserver-$2.json"
+    echo "$rt/jpserver-$2.json"
+}
+
+test_stale_record_unrelated_pid() {
+    local d="$UNIT_WORK_DIR/stale-unrelated" pid jf rc=0
+    mkdir -p "$d"
+    pid="$(spawn_unrelated)"
+    jf="$(plant_record "$d" "$pid")"
+    JUPYTER_DATA_DIR="$d/.jupyter/share/jupyter" check_existing_server 2>/dev/null || rc=$?
+    [ "$rc" -eq 1 ] && [ ! -e "$jf" ] && [ -e "$jf.stale" ] && kill -0 "$pid"
+}
+run_test "start: record whose pid is an unrelated process is stale, moved aside" \
+    test_stale_record_unrelated_pid
+
+test_stale_record_reused_by_later_jupyter() {
+    # A jupyter-looking process that started AFTER the record was written
+    # cannot be the server that wrote it.
+    local d="$UNIT_WORK_DIR/stale-later" pid jf rc=0
+    mkdir -p "$d"
+    pid="$(spawn_named jupyter-lab)"
+    jf="$(plant_record "$d" "$pid")"
+    touch -d '-1 hour' "$jf"
+    JUPYTER_DATA_DIR="$d/.jupyter/share/jupyter" check_existing_server 2>/dev/null || rc=$?
+    [ "$rc" -eq 1 ] && [ ! -e "$jf" ]
+}
+run_test "start: record older than its pid's process is stale" \
+    test_stale_record_reused_by_later_jupyter
+
+test_live_record_still_detected() {
+    # Positive control: a jupyter process that predates its record IS a
+    # running server, and its record is left alone.
+    local d="$UNIT_WORK_DIR/stale-live" pid jf
+    mkdir -p "$d"
+    pid="$(spawn_named jupyter-lab)"
+    sleep 0.2
+    jf="$(plant_record "$d" "$pid")"
+    JUPYTER_DATA_DIR="$d/.jupyter/share/jupyter" check_existing_server 2>/dev/null \
+        && [ -e "$jf" ]
+}
+run_test "start: live server record still refuses a second start" \
+    test_live_record_still_detected
+
+test_url_ignores_stale_record() {
+    local d="$UNIT_WORK_DIR/stale-url" pid
+    mkdir -p "$d"
+    pid="$(spawn_unrelated)"
+    plant_record "$d" "$pid" >/dev/null
+    ! (cd "$d" && "$LAB" url >/dev/null 2>&1)
+}
+run_test "url: ignores a record whose pid is an unrelated process" \
+    test_url_ignores_stale_record
+
+test_stop_never_signals_reused_pid() {
+    # The helper must not SIGTERM a process that merely inherited the pid —
+    # even one with "jupyter" in its argv.
+    local pid jf alive=0
+    pid="$(spawn_named jupyter-lab)"
+    jf="$(plant_record "$UNIT_WORK_DIR" "$pid")"
+    touch -d '-1 hour' "$jf"
+    lab_unit stop >/dev/null 2>&1 || true
+    sleep 0.2
+    kill -0 "$pid" 2>/dev/null && alive=1
+    rm -f "$jf"
+    [ "$alive" -eq 1 ]
+}
+run_test "stop: never signals a process that reused a recorded pid" \
+    test_stop_never_signals_reused_pid
+
+while read -r _p; do kill "$_p" 2>/dev/null || true; done < "$STALE_PIDS_FILE"
+
 echo
 echo "test-labsh: unit tests done — $pass/$total passed"
 echo

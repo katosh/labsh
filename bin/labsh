@@ -492,23 +492,93 @@ run_helper_fast() {
     exec "$LAB_VENV_DIR/bin/python" "$HELPER_PY" "$@"
 }
 
+# Validate one jpserver-*.json. Prints pid, url and token on three lines and
+# returns 0 when the recorded pid is still the server that wrote the record.
+# Returns 1 when the record is STALE (the reason goes to stdout instead), and
+# 2 when it cannot be read.
+#
+# Existence (kill -0) is not identity. The runtime dir lives on the project
+# filesystem and survives restarts (host reboot, container or PID-namespace
+# restart) while the server does not, so the recorded pid is often held by an
+# unrelated process afterwards. A record counts as live only when its pid
+# (1) is running, (2) is a jupyter server process by argv, and (3) started no
+# later than the record was written. jupyter_server writes the record after
+# it starts, so a process younger than the record cannot be its author. The
+# 60 s slack absorbs clock skew between this host and a network filesystem.
+read_server_record() {
+    python3 - "$1" <<'PYEOF'
+import json, os, re, sys
+jf = sys.argv[1]
+try:
+    with open(jf) as f:
+        d = json.load(f)
+    mtime = os.stat(jf).st_mtime
+except (OSError, ValueError):
+    sys.exit(2)
+pid = d.get("pid")
+if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+    sys.exit(2)
+
+def stale_reason():
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "pid %d is not running" % pid
+    except PermissionError:
+        return "pid %d now belongs to another user" % pid
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            argv = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+    except OSError:
+        return None  # no /proc: existence is all we can check
+    names = [os.path.basename(a) for a in argv]
+    is_server = any(re.match(r"jupyter(-(lab|server|notebook|labhub))?$", n) for n in names) or any(
+        a == "-m" and i + 1 < len(argv) and argv[i + 1] in ("jupyterlab", "jupyter_server", "notebook")
+        for i, a in enumerate(argv))
+    if not is_server:
+        return "pid %d is now an unrelated process (%s)" % (pid, " ".join(argv)[:60] or "?")
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            starttime = int(f.read().rsplit(")", 1)[1].split()[19])
+        with open("/proc/stat") as f:
+            btime = next(int(l.split()[1]) for l in f if l.startswith("btime "))
+        started = btime + starttime / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+    if started > mtime + 60:
+        return "pid %d started after the record was written (pid reused)" % pid
+    return None
+
+reason = stale_reason()
+if reason:
+    print(reason)
+    sys.exit(1)
+print("%d\n%s\n%s" % (pid, d.get("url", ""), d.get("token") or ""))
+PYEOF
+}
+
 # Check for an already-running labsh server by scanning jpserver-*.json files
 # in the runtime directory. Returns 0 (true) if a live server is found and
-# prints its URL to stderr; returns 1 (false) otherwise.
+# prints its URL to stderr; returns 1 (false) otherwise. Stale records are
+# moved aside (jpserver-<pid>.json.stale) so they cannot block a start.
 check_existing_server() {
     local runtime_dir="$JUPYTER_DATA_DIR/runtime"
     [ -d "$runtime_dir" ] || return 1
-    local jf pid url
+    local jf rec rc pid url
     for jf in "$runtime_dir"/jpserver-*.json; do
         [ -e "$jf" ] || continue
-        pid="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('pid',''))" "$jf" 2>/dev/null)" || continue
-        [ -n "$pid" ] || continue
-        if kill -0 "$pid" 2>/dev/null; then
-            url="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('url',''))" "$jf" 2>/dev/null)" || url="(unknown)"
-            echo "$PROG: server is already running (pid $pid, $url)" >&2
-            echo "$PROG: use 'labsh status' to see details, or 'labsh stop' to shut it down." >&2
-            return 0
+        rc=0; rec="$(read_server_record "$jf")" || rc=$?
+        if [ "$rc" -eq 1 ]; then
+            echo "$PROG: ignoring stale server record $(basename "$jf"): $rec" >&2
+            mv -f "$jf" "$jf.stale" 2>/dev/null \
+                || echo "$PROG: could not move it aside (read-only filesystem?)" >&2
+            continue
         fi
+        [ "$rc" -eq 0 ] || continue
+        { read -r pid; read -r url; } <<< "$rec"
+        echo "$PROG: server is already running (pid $pid, ${url:-(unknown)})" >&2
+        echo "$PROG: use 'labsh status' to see details, or 'labsh stop' to shut it down." >&2
+        return 0
     done
     return 1
 }
@@ -786,15 +856,12 @@ cmd_notebook() {
 find_server_pid() {
     local runtime_dir="$JUPYTER_DATA_DIR/runtime"
     [ -d "$runtime_dir" ] || return 1
-    local jf pid
+    local jf rec
     for jf in "$runtime_dir"/jpserver-*.json; do
         [ -e "$jf" ] || continue
-        pid="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('pid',''))" "$jf" 2>/dev/null)" || continue
-        [ -n "$pid" ] || continue
-        if kill -0 "$pid" 2>/dev/null; then
-            echo "$pid"
-            return 0
-        fi
+        rec="$(read_server_record "$jf")" || continue
+        echo "${rec%%$'\n'*}"
+        return 0
     done
     return 1
 }
@@ -1279,22 +1346,18 @@ cmd_url() {
     # Print the access URL of the running labsh server.
     local runtime_dir="$JUPYTER_DATA_DIR/runtime"
     [ -d "$runtime_dir" ] || die "no labsh server running (no runtime dir)"
-    local jf pid url token
+    local jf rec url token
     for jf in "$runtime_dir"/jpserver-*.json; do
         [ -e "$jf" ] || continue
-        pid="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('pid',''))" "$jf" 2>/dev/null)" || continue
-        [ -n "$pid" ] || continue
-        if kill -0 "$pid" 2>/dev/null; then
-            url="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('url',''))" "$jf" 2>/dev/null)" || url=""
-            token="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('token',''))" "$jf" 2>/dev/null)" || token=""
-            if [ -n "$url" ]; then
-                if [ -n "$token" ]; then
-                    echo "${url}lab?token=${token}"
-                else
-                    echo "${url}lab"
-                fi
-                return 0
+        rec="$(read_server_record "$jf")" || continue
+        { read -r _; read -r url; read -r token; } <<< "$rec"
+        if [ -n "$url" ]; then
+            if [ -n "$token" ]; then
+                echo "${url}lab?token=${token}"
+            else
+                echo "${url}lab"
             fi
+            return 0
         fi
     done
     die "no running labsh server found"
