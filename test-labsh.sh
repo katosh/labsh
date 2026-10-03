@@ -618,6 +618,39 @@ run_test "stop: never signals a process that reused a recorded pid" \
 
 while read -r _p; do kill "$_p" 2>/dev/null || true; done < "$STALE_PIDS_FILE"
 
+# --- helper venv rebuild after a /tmp wipe, from a damaged lockfile ---
+#
+# The helper venv lives on /tmp and is rebuilt from .jupyter/.labshvenv.lock
+# after a reboot or container restart wipes /tmp. An interrupted write can
+# leave that lockfile empty or truncated; the rebuild must still produce a
+# working helper venv.
+
+rebuild_with_lockfile() {  # rebuild_with_lockfile DIR LOCK-CONTENT
+    local d="$1" venv rc=0
+    mkdir -p "$d/.jupyter"
+    printf '%s' "$2" > "$d/.jupyter/.labshvenv.lock"
+    (cd "$d" && "$LAB" kernel add lockk >/dev/null 2>&1) || rc=$?
+    venv="$(readlink -f "$d/.jupyter/.labshvenv" 2>/dev/null)" || venv=""
+    [ "$rc" -eq 0 ] && [ -n "$venv" ] \
+        && "$venv/bin/python" -c "import psutil, jupyter_client, nbformat, websocket" 2>/dev/null \
+        && grep -qi '^jupyter-client==' "$d/.jupyter/.labshvenv.lock" \
+        || rc=1
+    case "$venv" in /tmp/labsh-venv-*) rm -rf "$venv" ;; esac
+    return "$rc"
+}
+
+test_helper_venv_rebuild_empty_lockfile() {
+    rebuild_with_lockfile "$UNIT_WORK_DIR/lock-empty" ""
+}
+run_test "helper venv: rebuilt from an EMPTY lockfile" \
+    test_helper_venv_rebuild_empty_lockfile
+
+test_helper_venv_rebuild_truncated_lockfile() {
+    rebuild_with_lockfile "$UNIT_WORK_DIR/lock-trunc" $'psutil\n'
+}
+run_test "helper venv: rebuilt from a TRUNCATED lockfile" \
+    test_helper_venv_rebuild_truncated_lockfile
+
 echo
 echo "test-labsh: unit tests done — $pass/$total passed"
 echo

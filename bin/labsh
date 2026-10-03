@@ -445,17 +445,35 @@ ensure_lab_venv() {
     "$LAB_VENV_DIR/bin/python" -c "import nbformat"        2>/dev/null || missing+=(nbformat)
     "$LAB_VENV_DIR/bin/python" -c "import websocket"       2>/dev/null || missing+=(websocket-client)
     if [ ${#missing[@]} -gt 0 ]; then
-        if [ "$created_fresh" -eq 1 ] && [ -f "$LAB_LOCK_FILE" ]; then
+        if [ "$created_fresh" -eq 1 ] && [ -s "$LAB_LOCK_FILE" ]; then
             # Rebuild from lockfile for reproducibility
             echo "$PROG: restoring labsh helper venv from $LAB_LOCK_FILE" >&2
             uv pip install --python "$LAB_VENV_DIR/bin/python" \
-                -r "$LAB_LOCK_FILE"
-        else
+                -r "$LAB_LOCK_FILE" \
+                || echo "$PROG: lockfile restore failed" >&2
+            # A truncated lockfile (interrupted write) restores only part of
+            # the set: re-check, and install whatever is still missing.
+            local dep
+            missing=()
+            for dep in psutil:psutil jupyter_client:jupyter_client \
+                       nbformat:nbformat websocket:websocket-client; do
+                "$LAB_VENV_DIR/bin/python" -c "import ${dep%%:*}" 2>/dev/null \
+                    || missing+=("${dep#*:}")
+            done
+        fi
+        if [ ${#missing[@]} -gt 0 ]; then
             echo "$PROG: installing ${missing[*]} into labsh helper venv" >&2
             uv pip install --python "$LAB_VENV_DIR/bin/python" "${missing[@]}"
-            # Freeze exact versions to lockfile on persistent storage
-            uv pip freeze --python "$LAB_VENV_DIR/bin/python" \
-                > "$LAB_LOCK_FILE" 2>/dev/null || true
+            # Freeze exact versions to lockfile on persistent storage. Write
+            # to a temp file and rename, so an interrupted write (crash,
+            # full or read-only filesystem) cannot leave a truncated lockfile.
+            local tmp_lock="$LAB_LOCK_FILE.tmp.$$"
+            if uv pip freeze --python "$LAB_VENV_DIR/bin/python" \
+                    > "$tmp_lock" 2>/dev/null && [ -s "$tmp_lock" ]; then
+                mv -f "$tmp_lock" "$LAB_LOCK_FILE" 2>/dev/null || rm -f "$tmp_lock"
+            else
+                rm -f "$tmp_lock" 2>/dev/null || true
+            fi
         fi
         # Pre-compile .pyc to halve NFS round-trips on subsequent imports
         "$LAB_VENV_DIR/bin/python" -m compileall -q \
