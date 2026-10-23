@@ -484,6 +484,7 @@ run_test "labsh token drops a .jupyter/.gitignore" test_token_gitignore_written
 # `labsh ext install`.
 # shellcheck disable=SC1090
 source <(sed -n '/^parse_server_flags() {$/,/^}$/p' "$LAB")
+# shellcheck disable=SC2034 # read by the sourced parse_server_flags
 PROG=labsh
 die() { echo "die: $*" >&2; return 1; }
 find_available_port() { echo "$1"; }
@@ -497,7 +498,7 @@ with_args_contain() {
 }
 
 test_with_args_ship_pip() {
-    EXT_FILE="/nonexistent" LABSH_WITH= IP=127.0.0.1 parse_server_flags
+    EXT_FILE="/nonexistent" LABSH_WITH='' IP=127.0.0.1 parse_server_flags
     with_args_contain pip
 }
 run_test "server env: baseline --with list ships pip" test_with_args_ship_pip
@@ -515,7 +516,7 @@ test_with_args_persisted_extensions() {
     mkdir -p "$d"
     printf 'jupyterlab-vim\n# a comment\n\njupyterlab-git==0.50.0\n' \
         > "$d/labsh-extensions"
-    EXT_FILE="$d/labsh-extensions" LABSH_WITH= IP=127.0.0.1 \
+    EXT_FILE="$d/labsh-extensions" LABSH_WITH='' IP=127.0.0.1 \
         parse_server_flags
     with_args_contain jupyterlab-vim \
         && with_args_contain "jupyterlab-git==0.50.0" \
@@ -523,6 +524,138 @@ test_with_args_persisted_extensions() {
 }
 run_test "server env: persisted ext specs included, comments skipped" \
     test_with_args_persisted_extensions
+
+# --- start/serve: help never starts a server; --https cert generation ---
+#
+# These run the real bin/labsh with uv, uvx and python3 stubbed first on
+# PATH. Each stub appends its name and argv to $STUB_LOG; python3 then
+# execs the real interpreter and uvx prints a URL so `start` returns.
+
+STUB_DIR="$UNIT_WORK_DIR/stubs"
+STUB_LOG="$UNIT_WORK_DIR/stubs.log"
+REAL_PYTHON3="$(command -v python3)"
+mkdir -p "$STUB_DIR"
+for _stub in uv uvx python3; do
+    cat > "$STUB_DIR/$_stub" <<STUB
+#!/usr/bin/env bash
+printf '%s %s\n' "$_stub" "\$*" >> "$STUB_LOG"
+case "$_stub" in
+    python3) exec "$REAL_PYTHON3" "\$@" ;;
+    uvx)     echo "http://127.0.0.1:8888/lab" ;;
+esac
+exit 0
+STUB
+    chmod +x "$STUB_DIR/$_stub"
+done
+
+# Run labsh with stubs in a fresh project dir $1; stdout/stderr land in
+# $1.out / $1.err. Returns labsh's exit code. BASH_ENV/ENV are dropped: a
+# startup file that prepends to PATH would put the real uv ahead of the
+# stubs and a "stubbed" run would launch a real server.
+stub_env() {
+    env -u BASH_ENV -u ENV -u JUPYTER_CONFIG_DIR -u JUPYTER_DATA_DIR \
+        -u JUPYTER_CERTFILE -u JUPYTER_KEYFILE -u PORT -u IP \
+        PATH="$STUB_DIR:$PATH" "$@"
+}
+lab_stubbed() {
+    local d="$1"; shift
+    mkdir -p "$d"
+    : > "$STUB_LOG"
+    (cd "$d" && stub_env "$LAB" "$@") > "$d.out" 2> "$d.err"
+}
+
+# Precondition for everything below: inside labsh's own bash, uv and uvx
+# must resolve to the stubs. If not, fail these tests rather than run them.
+stubs_resolve() {
+    local u x
+    u="$(stub_env bash -c 'command -v uv')"
+    x="$(stub_env bash -c 'command -v uvx')"
+    if [ "$u" != "$STUB_DIR/uv" ] || [ "$x" != "$STUB_DIR/uvx" ]; then
+        log "stubs not first on PATH (uv=$u uvx=$x)"
+        return 1
+    fi
+}
+run_test "start/serve stubs: uv and uvx resolve to the stubs" stubs_resolve
+if stubs_resolve >/dev/null; then
+
+# Help must exit 0, print usage on stdout, call no stub and write nothing
+# into the project dir (no .jupyter, so no pid/token/config).
+assert_help_no_side_effects() {
+    local d="$UNIT_WORK_DIR/help-$total"
+    lab_stubbed "$d" "$@" || return 1
+    grep -q "labsh start" "$d.out" || return 1
+    [ ! -s "$STUB_LOG" ] || { vlog "stub called: $(cat "$STUB_LOG")"; return 1; }
+    [ -z "$(ls -A "$d")" ]
+}
+
+test_start_help() { assert_help_no_side_effects start --help; }
+run_test "start --help prints usage, starts nothing" test_start_help
+
+test_start_h() { assert_help_no_side_effects start -h; }
+run_test "start -h prints usage, starts nothing" test_start_h
+
+test_start_https_help() { assert_help_no_side_effects start --https --help; }
+run_test "start --https --help prints usage, starts nothing" test_start_https_help
+
+test_start_port_help() { assert_help_no_side_effects start --port --help; }
+run_test "start --port --help is help, not a port" test_start_port_help
+
+test_serve_help() { assert_help_no_side_effects serve --help; }
+run_test "serve --help prints usage, starts nothing" test_serve_help
+
+test_bare_flags_help() { assert_help_no_side_effects --port 9000 -h; }
+run_test "labsh --port 9000 -h prints usage, starts nothing" test_bare_flags_help
+
+test_start_port_dash_rejected() {
+    local d="$UNIT_WORK_DIR/port-dash"
+    ! lab_stubbed "$d" start --port -1 \
+        && grep -q -- "--port requires a value" "$d.err" \
+        && ! grep -q '^uvx ' "$STUB_LOG"
+}
+run_test "start --port -1 is rejected before launch" test_start_port_dash_rejected
+
+test_start_ip_dash_rejected() {
+    local d="$UNIT_WORK_DIR/ip-dash"
+    ! lab_stubbed "$d" start --ip --https \
+        && grep -q -- "--ip requires a value" "$d.err" \
+        && ! grep -q '^uvx ' "$STUB_LOG"
+}
+run_test "start --ip --https is rejected before launch" test_start_ip_dash_rejected
+
+# Control: without --help the same stubs DO launch the server, so the
+# help tests above are not passing because the stubs are never reachable.
+# OPENSSL_CONF points at a missing file: cert generation must not depend
+# on the install's openssl.cnf.
+test_start_https_launches_without_openssl_cnf() {
+    command -v openssl >/dev/null 2>&1 || { log "SKIP: openssl not found"; return 0; }
+    local d="$UNIT_WORK_DIR/https-ctl"
+    OPENSSL_CONF="$UNIT_WORK_DIR/no-such-openssl.cnf" \
+        lab_stubbed "$d" start --https --ip 127.0.0.1 || return 1
+    grep -q '^uvx .*jupyter-lab.*--certfile' "$STUB_LOG" \
+        && [ -s "$d/.jupyter/ssl/labsh.pem" ] \
+        && openssl x509 -in "$d/.jupyter/ssl/labsh.pem" -noout -text \
+            | grep -q 'Version: 3' \
+        && [ -s "$d/.jupyter/labsh.bg.pid" ]
+}
+run_test "start --https launches; cert needs no system openssl.cnf" \
+    test_start_https_launches_without_openssl_cnf
+
+# A failing openssl must surface its own error, not a guess.
+test_start_https_openssl_error_surfaced() {
+    local d="$UNIT_WORK_DIR/https-fail"
+    local bad="$UNIT_WORK_DIR/bad-openssl"
+    mkdir -p "$bad"
+    printf '#!/bin/sh\necho "simulated openssl failure" >&2\nexit 1\n' \
+        > "$bad/openssl"
+    chmod +x "$bad/openssl"
+    ! PATH="$bad:$PATH" lab_stubbed "$d" start --https --ip 127.0.0.1 \
+        && grep -q "simulated openssl failure" "$d.err" \
+        && ! grep -q '^uvx ' "$STUB_LOG" \
+        && [ ! -e "$d/.jupyter/ssl/labsh.key" ]
+}
+run_test "start --https: openssl's error reaches the user" \
+    test_start_https_openssl_error_surfaced
+fi  # stubs_resolve
 
 echo
 echo "test-labsh: unit tests done — $pass/$total passed"
@@ -912,8 +1045,7 @@ run_test "native: kernel interrupt succeeds" test_kernel_interrupt
 
 test_client_ops_leave_server_alive() {
     lab_py kernel exec -n hello.ipynb "survivor = 12345" >/dev/null 2>&1
-    local i
-    for i in 1 2 3; do
+    for _ in 1 2 3; do
         lab_py kernel ps >/dev/null 2>&1
         lab_py kernel find hello.ipynb >/dev/null 2>&1
         lab_py status >/dev/null 2>&1
@@ -977,9 +1109,11 @@ test_kernel_restart_clears_state() {
     for _i in $(seq 1 20); do
         if lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
                 -n hello.ipynb "print('back')" 2>/dev/null | grep -q "back"; then
-            ! lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
-                -n hello.ipynb "print(pre_restart_var)" 2>/dev/null
-            return $?
+            if lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
+                    -n hello.ipynb "print(pre_restart_var)" 2>/dev/null; then
+                return 1
+            fi
+            return 0
         fi
         sleep 1
     done

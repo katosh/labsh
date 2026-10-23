@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **`labsh start --help` / `labsh serve --help` no longer start a
+  server.** Help was only recognised as the first word, so `start
+  --help` checked for uv, wrote `.jupyter/`, built the helper venv,
+  wrote the token and launched JupyterLab with `--help` passed
+  through to it. `start` and `serve` (and bare `labsh -h` after
+  other flags) now check for `-h`/`--help`/`--help-all` before `--`
+  first and print usage without doing anything else. `--port` and
+  `--ip` reject a value that starts with `-` (`start --port --help`
+  used to take `--help` as the port), and the port must be numeric.
+- **`--https` certificate generation no longer depends on the
+  install's `openssl.cnf`.** `openssl req` now gets an explicit
+  minimal config (with the stock `v3_ca` extensions, so the cert is
+  unchanged), so a missing system config no longer breaks it. When
+  openssl does fail, its own error is shown instead of a guess
+  ("is openssl installed?"), and partial key/cert files are removed.
+
 ## [0.5.0] - 2026-07-06
 
 ### Added — kernel resilience: stop guardrail + hot extension installs
