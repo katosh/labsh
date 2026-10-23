@@ -930,11 +930,37 @@ ensure_ssl_cert() {
         echo "$PROG: reusing existing cert at $SSL_DIR/" >&2
         return 0
     fi
+    command -v openssl >/dev/null 2>&1 \
+        || die "openssl not found on PATH (needed to generate a certificate for --https)"
     echo "$PROG: generating self-signed certificate in $SSL_DIR/" >&2
-    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout "$JUPYTER_KEYFILE" -out "$JUPYTER_CERTFILE" \
-        -subj "/CN=$(hostname)/O=labsh-self-signed" 2>/dev/null \
-        || die "failed to generate self-signed certificate (is openssl installed?)"
+    # Pass an explicit config rather than relying on the install's
+    # openssl.cnf: `openssl req` refuses to run when that file is missing
+    # (seen with a fresh Homebrew openssl). The [v3_ca] section mirrors the
+    # stock config so the cert is the same X.509 v3 cert as before; without
+    # it openssl 1.1.x emits a v1 cert.
+    local cnf ossl_err
+    cnf="$(mktemp "${TMPDIR:-/tmp}/labsh-openssl.XXXXXX")" \
+        || die "failed to create a temporary openssl config"
+    cat > "$cnf" <<'CNF'
+[req]
+distinguished_name = dn
+x509_extensions = v3_ca
+prompt = no
+[dn]
+[v3_ca]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+basicConstraints = critical,CA:true
+CNF
+    if ! ossl_err="$(openssl req -config "$cnf" -x509 -nodes -days 365 \
+            -newkey rsa:2048 \
+            -keyout "$JUPYTER_KEYFILE" -out "$JUPYTER_CERTFILE" \
+            -subj "/CN=$(hostname)/O=labsh-self-signed" 2>&1)"; then
+        rm -f "$cnf" "$JUPYTER_KEYFILE" "$JUPYTER_CERTFILE"
+        die "failed to generate self-signed certificate; openssl said:
+$ossl_err"
+    fi
+    rm -f "$cnf"
     chmod 600 "$JUPYTER_KEYFILE"
     export JUPYTER_CERTFILE JUPYTER_KEYFILE
 }
@@ -1067,14 +1093,18 @@ parse_server_flags() {
                 WITH_AI=0
                 shift ;;
             --port)
-                [ -n "${2:-}" ] || die "start: --port requires a value"
+                case "${2:-}" in
+                    ""|-*) die "start: --port requires a value" ;;
+                esac
                 RESOLVED_PORT="$2"
                 shift 2 ;;
             --port=*)
                 RESOLVED_PORT="${1#--port=}"
                 shift ;;
             --ip)
-                [ -n "${2:-}" ] || die "start: --ip requires a value"
+                case "${2:-}" in
+                    ""|-*) die "start: --ip requires a value" ;;
+                esac
                 RESOLVED_IP="$2"
                 shift 2 ;;
             --ip=*)
@@ -1085,6 +1115,12 @@ parse_server_flags() {
                 shift ;;
         esac
     done
+    case "$RESOLVED_PORT" in
+        ""|*[!0-9]*) die "start: invalid port '$RESOLVED_PORT' (expected a number)" ;;
+    esac
+    case "$RESOLVED_IP" in
+        ""|-*) die "start: invalid --ip '$RESOLVED_IP'" ;;
+    esac
 
     WITH_ARGS=(
         --with jupyterlmod
@@ -1144,7 +1180,50 @@ parse_server_flags() {
     RESOLVED_PORT="$avail"
 }
 
+# True if a start/serve argument before `--` asks for help. Checked first
+# thing in cmd_start/cmd_serve so a help request never reaches the side
+# effects (uv check, .jupyter writes, token, server launch) and is never
+# passed through to jupyter-lab, which would start a server.
+server_help_requested() {
+    local a
+    for a in "$@"; do
+        case "$a" in
+            --) return 1 ;;
+            -h|--help|--help-all) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+server_usage() {
+    cat <<'SRVHELP'
+Usage:
+  labsh start [--https] [--port N] [--ip ADDR] [--with-ai|--no-ai] [JUPYTER-ARGS...]
+                               Start JupyterLab in the background, log to
+                               ./.jupyter/labsh.bg.log, return immediately
+  labsh serve [same flags]     Start JupyterLab in the foreground
+                               (bare `labsh` does the same)
+
+Options:
+  --https        Serve over TLS; generates a self-signed cert in
+                 ./.jupyter/ssl/ unless JUPYTER_CERTFILE/JUPYTER_KEYFILE are set
+  --port N       First port to try (default 8888, env PORT); the next free
+                 port up to N+9 is used
+  --ip ADDR      Bind address (default 0.0.0.0, env IP)
+  --with-ai      Include notebook-intelligence (env LABSH_AI=1); --no-ai overrides
+  -h, --help     Show this help without starting anything
+
+Other arguments are passed to jupyter-lab. For jupyter-lab's own options:
+  uvx --from jupyterlab jupyter-lab --help-all
+Run `labsh help` for the full labsh usage.
+SRVHELP
+}
+
 cmd_start() {
+    if server_help_requested "$@"; then
+        server_usage
+        return 0
+    fi
     require_uv
     mkdir -p "$JUPYTER_CONFIG_DIR" "$JUPYTER_DATA_DIR"
 
@@ -1301,6 +1380,10 @@ cmd_url() {
 }
 
 cmd_serve() {
+    if server_help_requested "$@"; then
+        server_usage
+        return 0
+    fi
     require_uv
     mkdir -p "$JUPYTER_CONFIG_DIR" "$JUPYTER_DATA_DIR"
 
