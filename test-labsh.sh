@@ -484,6 +484,7 @@ run_test "labsh token drops a .jupyter/.gitignore" test_token_gitignore_written
 # `labsh ext install`.
 # shellcheck disable=SC1090
 source <(sed -n '/^parse_server_flags() {$/,/^}$/p' "$LAB")
+# shellcheck disable=SC2034 # read by the sourced parse_server_flags
 PROG=labsh
 die() { echo "die: $*" >&2; return 1; }
 find_available_port() { echo "$1"; }
@@ -497,7 +498,7 @@ with_args_contain() {
 }
 
 test_with_args_ship_pip() {
-    EXT_FILE="/nonexistent" LABSH_WITH= IP=127.0.0.1 parse_server_flags
+    EXT_FILE="/nonexistent" LABSH_WITH='' IP=127.0.0.1 parse_server_flags
     with_args_contain pip
 }
 run_test "server env: baseline --with list ships pip" test_with_args_ship_pip
@@ -515,7 +516,7 @@ test_with_args_persisted_extensions() {
     mkdir -p "$d"
     printf 'jupyterlab-vim\n# a comment\n\njupyterlab-git==0.50.0\n' \
         > "$d/labsh-extensions"
-    EXT_FILE="$d/labsh-extensions" LABSH_WITH= IP=127.0.0.1 \
+    EXT_FILE="$d/labsh-extensions" LABSH_WITH='' IP=127.0.0.1 \
         parse_server_flags
     with_args_contain jupyterlab-vim \
         && with_args_contain "jupyterlab-git==0.50.0" \
@@ -569,8 +570,10 @@ stubs_resolve() {
     local u x
     u="$(stub_env bash -c 'command -v uv')"
     x="$(stub_env bash -c 'command -v uvx')"
-    [ "$u" = "$STUB_DIR/uv" ] && [ "$x" = "$STUB_DIR/uvx" ] \
-        || { log "stubs not first on PATH (uv=$u uvx=$x)"; return 1; }
+    if [ "$u" != "$STUB_DIR/uv" ] || [ "$x" != "$STUB_DIR/uvx" ]; then
+        log "stubs not first on PATH (uv=$u uvx=$x)"
+        return 1
+    fi
 }
 run_test "start/serve stubs: uv and uvx resolve to the stubs" stubs_resolve
 if stubs_resolve >/dev/null; then
@@ -1042,8 +1045,7 @@ run_test "native: kernel interrupt succeeds" test_kernel_interrupt
 
 test_client_ops_leave_server_alive() {
     lab_py kernel exec -n hello.ipynb "survivor = 12345" >/dev/null 2>&1
-    local i
-    for i in 1 2 3; do
+    for _ in 1 2 3; do
         lab_py kernel ps >/dev/null 2>&1
         lab_py kernel find hello.ipynb >/dev/null 2>&1
         lab_py status >/dev/null 2>&1
@@ -1107,9 +1109,11 @@ test_kernel_restart_clears_state() {
     for _i in $(seq 1 20); do
         if lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
                 -n hello.ipynb "print('back')" 2>/dev/null | grep -q "back"; then
-            ! lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
-                -n hello.ipynb "print(pre_restart_var)" 2>/dev/null
-            return $?
+            if lab_py kernel exec --server "$SRV_URL" --token "$TOKEN" \
+                    -n hello.ipynb "print(pre_restart_var)" 2>/dev/null; then
+                return 1
+            fi
+            return 0
         fi
         sleep 1
     done
