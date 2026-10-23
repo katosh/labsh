@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-22
+
 ### Fixed
 
 - **`labsh start --help` / `labsh serve --help` no longer start a
